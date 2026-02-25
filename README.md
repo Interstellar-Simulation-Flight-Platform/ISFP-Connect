@@ -47,7 +47,7 @@ ISFP-Connect 官方桌面客户端是一款专为模拟飞行爱好者设计的�
    ```
 2. **执行打包命令**:
    ```powershell
-   nuitka --standalone --show-progress --plugin-enable=qt-plugins --windows-disable-console --include-data-dir=assets=assets main.py
+   nuitka --standalone --show-progress --plugin-enable=pyside6 --windows-disable-console --include-data-dir=assets=assets main.py
    ```
 
 ## 🛠️ 技术细节
