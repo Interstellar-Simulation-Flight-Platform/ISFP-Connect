@@ -1,7 +1,5 @@
 # ISFP-Connect (v0.1.0)
 
-![ISFP Banner](assets/logo.png)
-
 ISFP-Connect 官方桌面客户端是一款专为模拟飞行爱好者设计的综合性辅助工具。基于 **PySide6** 框架开发，提供极佳的 Windows 原生性能与现代化视觉体验。
 
 ## 🌟 核心功能
