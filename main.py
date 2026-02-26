@@ -1,6 +1,7 @@
 import sys
 import requests
 import ctypes
+import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLineEdit, QPushButton, QTextEdit, 
                              QLabel, QTabWidget, QListWidget, QListWidgetItem,
@@ -26,11 +27,20 @@ class APIThread(QThread):
 
     def run(self):
         try:
+            start_time = time.time()
             response = requests.get(self.url, params=self.params, timeout=10)
+            end_time = time.time()
+            latency = int((end_time - start_time) * 1000)
+            
+            result = {}
             if self.is_json:
-                self.finished.emit(response.json())
+                result = response.json()
             else:
-                self.finished.emit({"raw_text": response.text})
+                result = {"raw_text": response.text}
+            
+            # 注入延迟数据
+            result["_latency"] = latency
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -156,8 +166,8 @@ class ISFPApp(QMainWindow):
 
         # 在线机组卡片
         self.pilot_stat_card = self.create_stat_panel("在线机组", "---", "#2ecc71")
-        # 服务器延迟 (模拟)
-        self.ping_stat_card = self.create_stat_panel("网络延迟", "24ms", "#f1c40f")
+        # 服务器延迟
+        self.ping_stat_card = self.create_stat_panel("网络延迟", "---", "#f1c40f")
         # 运行时间
         self.uptime_stat_card = self.create_stat_panel("系统状态", "正常", "#3498db")
 
@@ -207,10 +217,16 @@ class ISFPApp(QMainWindow):
 
     def on_home_stats_ready(self, data):
         pilots = data.get("pilots", [])
+        latency = data.get("_latency", 0)
+        
         # 更新首页卡片中的数值
-        val_label = self.pilot_stat_card.findChild(QLabel, "ValueLabel")
-        if val_label:
-            val_label.setText(str(len(pilots)))
+        p_val = self.pilot_stat_card.findChild(QLabel, "ValueLabel")
+        if p_val:
+            p_val.setText(str(len(pilots)))
+            
+        l_val = self.ping_stat_card.findChild(QLabel, "ValueLabel")
+        if l_val:
+            l_val.setText(f"{latency}ms")
 
     def create_weather_tab(self):
         widget = QWidget()
