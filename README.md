@@ -26,7 +26,7 @@ ISFP-Connect 官方桌面客户端是一款专为模拟飞行爱好者设计的�
 1. **克隆/下载项目**
 2. **安装依赖**:
    ```powershell
-   pip install PySide6 PySide6-WebEngine requests
+   pip install -r requirements.txt
    ```
 3. **准备素材**:
    确保 `assets/` 文件夹下包含：

@@ -367,7 +367,7 @@ class ISFPApp(QMainWindow):
             return
             
         # 终极 URL 解析方案
-        from urllib.parse import urljoin, quote
+        from urllib.parse import urljoin, quote, urlparse, urlunparse
         base_api_url = "https://isfpapi.flyisfp.com"
         
         if url.startswith("http"):
@@ -376,11 +376,19 @@ class ISFPApp(QMainWindow):
             full_url = urljoin(base_api_url, url)
             
         try:
-            parts = full_url.split("://", 1)
-            if len(parts) > 1:
-                domain_parts = parts[1].split("/", 1)
-                if len(domain_parts) > 1:
-                    full_url = f"{parts[0]}://{domain_parts[0]}/{quote(domain_parts[1])}"
+            # 修复：使用 urlparse 正确处理 query 参数，防止 ? 和 = 被编码
+            parsed = urlparse(full_url)
+            # 仅对 path 部分进行编码，保留 /
+            new_path = quote(parsed.path, safe='/')
+            
+            full_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                new_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
         except: pass
         
         req = QNetworkRequest(QUrl(full_url))
