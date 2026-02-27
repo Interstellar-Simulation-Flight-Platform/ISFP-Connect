@@ -55,6 +55,28 @@ class APIThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+# ================= 工具类：防抖装饰器 =================
+def debounce(wait_ms=500):
+    """ 装饰器：防止按钮被快速重复点击 """
+    def decorator(func):
+        def wrapper(self, *args, **kwargs):
+            current_time = time.time() * 1000
+            if not hasattr(self, '_last_click_time'):
+                self._last_click_time = {}
+            
+            # 使用函数名作为 key，区分不同按钮
+            key = func.__name__
+            last_time = self._last_click_time.get(key, 0)
+            
+            if current_time - last_time < wait_ms:
+                # print(f"DEBUG: Click ignored for {key}")
+                return
+            
+            self._last_click_time[key] = current_time
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
+
 class ISFPApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -70,7 +92,21 @@ class ISFPApp(QMainWindow):
         self.auth_token = None
         self.user_data = None
         
+        # 线程管理器，防止 QThread 被 GC 回收
+        self._active_threads = set()
+        
         self.setup_ui()
+
+    def manage_thread(self, thread):
+        """ 托管线程生命周期，防止被 GC 回收导致崩溃 """
+        self._active_threads.add(thread)
+        
+        def cleanup():
+            if thread in self._active_threads:
+                self._active_threads.remove(thread)
+                
+        thread.finished.connect(cleanup)
+        thread.start()
 
     def setup_ui(self):
         # 主窗口背景
@@ -245,7 +281,7 @@ class ISFPApp(QMainWindow):
         self.activities_thread = APIThread(f"{ISFP_API_BASE}/activities", params=params, headers=headers)
         self.activities_thread.finished.connect(self.display_activities)
         self.activities_thread.error.connect(self.on_activities_error)
-        self.activities_thread.start()
+        self.manage_thread(self.activities_thread)
 
     def on_activities_error(self, error_msg):
         error_lbl = QLabel(f"❌ 网络请求异常:\n{error_msg}")
@@ -565,7 +601,7 @@ class ISFPApp(QMainWindow):
                     headers={"Authorization": f"Bearer {self.auth_token}"}
                 )
                 self.sign_thread.finished.connect(lambda d: self.show_notification(d.get("message", "报名成功")))
-                self.sign_thread.start()
+                self.manage_thread(self.sign_thread)
                 
             def handle_unsign():
                 # 二次确认
@@ -584,7 +620,7 @@ class ISFPApp(QMainWindow):
                     headers={"Authorization": f"Bearer {self.auth_token}"}
                 )
                 self.unsign_thread.finished.connect(lambda d: self.show_notification(d.get("message", "取消报名成功")))
-                self.unsign_thread.start()
+                self.manage_thread(self.unsign_thread)
             
             sign_btn.clicked.connect(handle_sign)
             unsign_btn.clicked.connect(handle_unsign)
@@ -930,6 +966,7 @@ class ISFPApp(QMainWindow):
         self.account_layout.addWidget(container, alignment=Qt.AlignCenter)
         self.account_layout.addStretch()
 
+    @debounce(1000)
     def handle_login(self):
         user = self.login_user.text().strip()
         pwd = self.login_pass.text().strip()
@@ -940,7 +977,7 @@ class ISFPApp(QMainWindow):
             "password": pwd
         })
         self.login_thread.finished.connect(self.on_login_finished)
-        self.login_thread.start()
+        self.manage_thread(self.login_thread)
 
     def on_login_finished(self, data):
         if data.get("code") == "LOGIN_SUCCESS":
@@ -954,6 +991,7 @@ class ISFPApp(QMainWindow):
         else:
             self.show_notification(f"登录失败: {data.get('message')}")
 
+    @debounce(1000)
     def handle_send_code(self):
         email = self.reg_email.text().strip()
         cid = self.reg_cid.text().strip()
@@ -967,7 +1005,7 @@ class ISFPApp(QMainWindow):
             "cid": int(cid)
         })
         self.code_thread.finished.connect(self.on_code_sent)
-        self.code_thread.start()
+        self.manage_thread(self.code_thread)
 
     def on_code_sent(self, data):
         # 根据 emailapi.md 更新状态码判断
@@ -979,6 +1017,7 @@ class ISFPApp(QMainWindow):
             msg = data.get("message", "发送失败")
             self.show_notification(f"发送失败: {msg}")
 
+    @debounce(1000)
     def handle_register(self):
         payload = {
             "username": self.reg_user.text().strip(),
@@ -989,7 +1028,7 @@ class ISFPApp(QMainWindow):
         }
         self.reg_thread = APIThread(f"{ISFP_API_BASE}/users", method="POST", json_data=payload)
         self.reg_thread.finished.connect(self.on_register_finished)
-        self.reg_thread.start()
+        self.manage_thread(self.reg_thread)
 
     def on_register_finished(self, data):
         if data.get("code") == "REGISTER_SUCCESS":
@@ -1078,7 +1117,7 @@ class ISFPApp(QMainWindow):
             add_items(controllers, atc_list, "📡")
             
         self.history_thread.finished.connect(on_history_loaded)
-        self.history_thread.start()
+        self.manage_thread(self.history_thread)
         
         dialog.exec()
 
@@ -1174,7 +1213,7 @@ class ISFPApp(QMainWindow):
     def update_home_stats(self):
         self.stats_thread = APIThread(f"{ISFP_API_BASE}/clients")
         self.stats_thread.finished.connect(self.on_home_stats_ready)
-        self.stats_thread.start()
+        self.manage_thread(self.stats_thread)
 
     def on_home_stats_ready(self, data):
         pilots = data.get("pilots", [])
@@ -1532,7 +1571,7 @@ class ISFPApp(QMainWindow):
             headers={"Authorization": f"Bearer {self.auth_token}"}
         )
         self.ticket_thread.finished.connect(self.display_tickets)
-        self.ticket_thread.start()
+        self.manage_thread(self.ticket_thread)
 
     def display_tickets(self, data):
         items = data.get("data", {}).get("items", [])
@@ -1666,7 +1705,7 @@ class ISFPApp(QMainWindow):
                 headers={"Authorization": f"Bearer {self.auth_token}"}
             )
             self.create_ticket_thread.finished.connect(lambda d: [self.show_notification("工单创建成功"), dialog.accept(), self.load_tickets()])
-            self.create_ticket_thread.start()
+            self.manage_thread(self.create_ticket_thread)
             
         submit_btn.clicked.connect(submit)
         layout.addWidget(submit_btn)
@@ -1683,7 +1722,7 @@ class ISFPApp(QMainWindow):
         # 嵌套调用示例（实际应使用多个线程或链式调用）
         self.metar_thread = APIThread(f"{ISFP_API_BASE}/metar", {"icao": icao})
         self.metar_thread.finished.connect(lambda data: self.handle_metar(data, icao))
-        self.metar_thread.start()
+        self.manage_thread(self.metar_thread)
 
     def handle_metar(self, data, icao):
         # 核心修复：处理 API 返回的数组或字符串，并移除多余的引号和括号
@@ -1698,7 +1737,7 @@ class ISFPApp(QMainWindow):
             
         self.taf_thread = APIThread(TAF_API_URL, {"ids": icao.lower()}, is_json=False)
         self.taf_thread.finished.connect(lambda res: self.update_weather_ui(metar, res.get('raw_text', '未找到 TAF'), icao))
-        self.taf_thread.start()
+        self.manage_thread(self.taf_thread)
 
     def update_weather_ui(self, metar, taf, icao):
         html = f"""
@@ -1731,7 +1770,7 @@ class ISFPApp(QMainWindow):
         self.online_list.clear()
         self.online_thread = APIThread(f"{ISFP_API_BASE}/clients")
         self.online_thread.finished.connect(self.display_pilots)
-        self.online_thread.start()
+        self.manage_thread(self.online_thread)
 
     def display_pilots(self, data):
         pilots = data.get("pilots", [])
@@ -1775,7 +1814,7 @@ class ISFPApp(QMainWindow):
         if not reg: return
         self.photo_thread = APIThread(PLANE_INFO_URL, {"registration": reg})
         self.photo_thread.finished.connect(self.display_plane_photo)
-        self.photo_thread.start()
+        self.manage_thread(self.photo_thread)
 
     def display_plane_photo(self, data):
         if data.get("success") and data["data"].get("photo_found"):
