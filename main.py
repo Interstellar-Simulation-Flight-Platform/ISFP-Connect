@@ -1119,13 +1119,13 @@ class ISFPApp(QMainWindow):
 
         # 在线机组卡片
         self.pilot_stat_card = self.create_stat_panel("在线机组", "---", "#2ecc71")
-        # 服务器延迟
-        self.ping_stat_card = self.create_stat_panel("网络延迟", "---", "#f1c40f")
+        # 在线管制 (替代原网络延迟)
+        self.atc_stat_card = self.create_stat_panel("在线管制", "---", "#f1c40f")
         # 运行时间
         self.uptime_stat_card = self.create_stat_panel("系统状态", "正常", "#3498db")
 
         stats_layout.addWidget(self.pilot_stat_card)
-        stats_layout.addWidget(self.ping_stat_card)
+        stats_layout.addWidget(self.atc_stat_card)
         stats_layout.addWidget(self.uptime_stat_card)
 
         layout.addWidget(stats_container)
@@ -1170,16 +1170,16 @@ class ISFPApp(QMainWindow):
 
     def on_home_stats_ready(self, data):
         pilots = data.get("pilots", [])
-        latency = data.get("_latency", 0)
+        controllers = data.get("controllers", [])
         
         # 更新首页卡片中的数值
         p_val = self.pilot_stat_card.findChild(QLabel, "ValueLabel")
         if p_val:
             p_val.setText(str(len(pilots)))
             
-        l_val = self.ping_stat_card.findChild(QLabel, "ValueLabel")
-        if l_val:
-            l_val.setText(f"{latency}ms")
+        a_val = self.atc_stat_card.findChild(QLabel, "ValueLabel")
+        if a_val:
+            a_val.setText(str(len(controllers)))
 
     def create_weather_tab(self):
         widget = QWidget()
