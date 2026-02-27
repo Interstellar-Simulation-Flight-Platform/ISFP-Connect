@@ -1519,6 +1519,12 @@ class ISFPApp(QMainWindow):
             return
 
         self.ticket_list.clear()
+        
+        # 修复：防止线程被垃圾回收导致崩溃
+        if hasattr(self, 'ticket_thread') and self.ticket_thread.isRunning():
+            self.ticket_thread.terminate()
+            self.ticket_thread.wait()
+            
         # 调用 /tickets/self 接口
         self.ticket_thread = APIThread(
             f"{ISFP_API_BASE}/tickets/self",
@@ -1543,7 +1549,23 @@ class ISFPApp(QMainWindow):
         for t in items:
             t_type = t.get("type", 4)
             title_text = f"[{type_map.get(t_type, '未知')}] {t.get('title', '无标题')}"
-            status = "✅ 已结单" if t.get("closer") else "⏳ 处理中"
+            
+            # 状态逻辑修正：
+            # 1. 如果有 closer (结单人ID)，则为“已关闭”
+            # 2. 如果没有 closer 但有 reply (回复内容)，则为“已回复”
+            # 3. 否则为“处理中”
+            reply = t.get("reply")
+            closer = t.get("closer")
+            
+            if closer:
+                status_text = "🔒 已关闭"
+                status_color = "#95a5a6" # 灰色
+            elif reply:
+                status_text = "✅ 已回复"
+                status_color = "#2ecc71" # 绿色
+            else:
+                status_text = "⏳ 处理中"
+                status_color = "#f39c12" # 黄色
             
             # 自定义 Item Widget
             item_widget = QWidget()
@@ -1557,8 +1579,8 @@ class ISFPApp(QMainWindow):
             title_lbl = QLabel(t.get("title", ""))
             title_lbl.setStyleSheet("color: white; font-weight: bold; font-size: 15px; margin-left: 5px;")
             
-            status_lbl = QLabel(status)
-            status_lbl.setStyleSheet(f"color: {'#2ecc71' if t.get('closer') else '#f39c12'}; font-weight: bold;")
+            status_lbl = QLabel(status_text)
+            status_lbl.setStyleSheet(f"color: {status_color}; font-weight: bold;")
             
             top_row.addWidget(type_lbl)
             top_row.addWidget(title_lbl)
