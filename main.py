@@ -6,11 +6,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLineEdit, QPushButton, QTextEdit, 
                              QLabel, QTabWidget, QListWidget, QListWidgetItem,
                              QScrollArea, QFrame, QGraphicsBlurEffect, QSplitter,
-                             QDialog)
+                             QDialog, QCheckBox)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal, QUrl
+from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal, QUrl, QObject, Slot, QSettings
 from PySide6.QtGui import QPixmap, QIcon, QFont, QPalette, QColor, QBrush, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PySide6.QtWebChannel import QWebChannel
 
 # ================= API 配置 =================
 ISFP_API_BASE = "https://isfpapi.flyisfp.com/api"
@@ -77,6 +78,27 @@ def debounce(wait_ms=500):
         return wrapper
     return decorator
 
+class MapBridge(QObject):
+    """ 连飞地图 JS 交互桥接 """
+    # 定义信号，用于从 Python 向 JS 推送数据
+    updatePilotsSignal = Signal(str)
+    drawPathSignal = Signal(str)
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    @Slot(str)
+    def get_flight_path(self, callsign):
+        self.app.fetch_flight_path(callsign)
+
+    @Slot()
+    def map_ready(self):
+        """ JS 通知地图已加载完毕 """
+        self.app._map_js_ready = True
+        # 立即触发一次数据加载
+        QTimer.singleShot(100, self.app.load_map_data)
+
 class ISFPApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -91,6 +113,12 @@ class ISFPApp(QMainWindow):
         # 用户认证数据
         self.auth_token = None
         self.user_data = None
+        
+        # 初始化设置 - 使用本地 ini 文件存储，不使用注册表
+        # 将配置保存在应用同级目录下的 config.ini 中
+        import os
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+        self.settings = QSettings(config_path, QSettings.IniFormat)
         
         # 线程管理器，防止 QThread 被 GC 回收
         self._active_threads = set()
@@ -121,8 +149,8 @@ class ISFPApp(QMainWindow):
         # 【核心优化】添加黑色半透明遮罩层，确保背景不会干扰文字阅读
         self.bg_overlay = QFrame(self)
         self.bg_overlay.setGeometry(0, 0, self.win_width, self.win_height)
-        # 透明度设置为 0.65 (165/255)，背景会变暗但依然可见
-        self.bg_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 165); border: none;")
+        # 透明度设置为 0.78 (200/255)，背景会变暗但依然可见
+        self.bg_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 200); border: none;")
         self.bg_overlay.lower() # 确保在所有交互控件下方
         self.bg_label.lower()   # 确保背景图在最底层
 
@@ -202,6 +230,7 @@ class ISFPApp(QMainWindow):
 
         self.tabs.addTab(self.create_home_tab(), "首页")
         self.tabs.addTab(self.create_weather_tab(), "气象")
+        self.tabs.addTab(self.create_map_tab(), "地图") # 新增连飞地图
         self.tabs.addTab(self.create_online_tab(), "在线")
         self.tabs.addTab(self.create_flight_plan_tab(), "计划")
         self.tabs.addTab(self.create_activities_tab(), "活动")
@@ -219,6 +248,282 @@ class ISFPApp(QMainWindow):
             self.load_tickets()
         elif tab_name == "活动":
             self.load_activities()
+        elif tab_name == "地图":
+            self.load_map_data()
+
+    def create_map_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.map_view = QWebEngineView()
+        self.map_view.setStyleSheet("background: #1a1a1a;")
+        
+        # 配置 WebChannel
+        self.map_channel = QWebChannel()
+        self.map_bridge = MapBridge(self)
+        self.map_channel.registerObject("bridge", self.map_bridge)
+        self.map_view.page().setWebChannel(self.map_channel)
+        
+        # 标记 JS 是否已就绪
+        self._map_js_ready = False
+        
+        # 移除不可靠的 loadFinished 监听，改用 JS 主动通知
+        # self.map_view.loadFinished.connect(lambda: setattr(self, '_map_js_ready', True))
+        
+        # 加载地图 HTML
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body, html, #map { height: 100%; margin: 0; padding: 0; background: #1a1a1a; }
+                .leaflet-popup-content-wrapper { background: rgba(0,0,0,0.8); color: white; border-radius: 8px; }
+                .leaflet-popup-tip { background: rgba(0,0,0,0.8); }
+            </style>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+        </head>
+        <body>
+            <div id="map"></div>
+            <script>
+                var map = L.map('map').setView([35.0, 105.0], 4);
+                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                    attribution: '&copy; OpenStreetMap &copy; CARTO',
+                    subdomains: 'abcd',
+                    maxZoom: 19
+                }).addTo(map);
+
+                // 将变量挂载到 window 对象，确保全局可访问
+                window.markers = {};
+                window.flightPaths = {}; // 改为存储多个航迹: {callsign: polyline}
+                window.bridge = null;
+
+                // 核心修复：直接定义在 window 上，不要用 var/let
+                updatePilots = function(pilots) {
+                    var currentIds = [];
+                    pilots.forEach(function(p) {
+                        var id = p.cid; 
+                        currentIds.push(id);
+                        
+                        var lat = p.latitude;
+                        var lng = p.longitude;
+                        
+                        // 动态按钮文本
+                        var hasPath = window.flightPaths[p.callsign] ? "隐藏航迹" : "显示航迹";
+                        var btnColor = window.flightPaths[p.callsign] ? "#c0392b" : "#34495e";
+                        
+                        var info = `
+                            <div style='font-family: Consolas, sans-serif; font-size: 13px;'>
+                                <b style='color: #3498db; font-size: 15px;'>${p.callsign}</b><br>
+                                <hr style='border: 0; border-top: 1px solid #555; margin: 5px 0;'>
+                                ✈ 机型: <span style='color: #2ecc71;'>${p.aircraft || 'Unknown'}</span><br>
+                                📏 高度: <span style='color: #f1c40f;'>${p.altitude} ft</span><br>
+                                🚀 速度: ${p.ground_speed} kts<br>
+                                📡 应答机: ${p.transponder}<br>
+                                <button id="btn-${p.callsign}" onclick="window.togglePath('${p.callsign}')" style="margin-top:8px; width: 100%; padding: 5px; background: ${btnColor}; color: white; border: none; border-radius: 4px; cursor: pointer;">${hasPath}</button>
+                            </div>
+                        `;
+
+                        if (window.markers[id]) {
+                            window.markers[id].setLatLng([lat, lng]);
+                            if (window.markers[id].getPopup().isOpen()) {
+                                // 保持 popup 内容最新
+                            } else {
+                                window.markers[id].setPopupContent(info);
+                            }
+                        } else {
+                            // 自定义飞机图标
+                            var icon = L.divIcon({
+                                className: 'plane-icon',
+                                html: `<div style='transform: rotate(${p.heading}deg); color: #3498db; font-size: 20px;'>✈</div>`,
+                                iconSize: [24, 24],
+                                iconAnchor: [12, 12]
+                            });
+                            
+                            var marker = L.marker([lat, lng], {icon: icon}).addTo(map);
+                            marker.bindPopup(info);
+                            window.markers[id] = marker;
+                        }
+                        
+                        // 更新图标旋转
+                        var iconDiv = window.markers[id].getElement().querySelector('div');
+                        if(iconDiv) iconDiv.style.transform = `rotate(${p.heading - 45}deg)`;
+                    });
+
+                    // 移除下线机组
+                    for (var id in window.markers) {
+                        if (!currentIds.includes(parseInt(id)) && !currentIds.includes(id)) {
+                            map.removeLayer(window.markers[id]);
+                            delete window.markers[id];
+                        }
+                    }
+                };
+                
+                // 切换航迹显示/隐藏
+                togglePath = function(callsign) {
+                    if (window.flightPaths[callsign]) {
+                        // 如果已存在，则移除（隐藏）
+                        map.removeLayer(window.flightPaths[callsign]);
+                        delete window.flightPaths[callsign];
+                        // 更新按钮状态
+                        var btn = document.getElementById('btn-' + callsign);
+                        if(btn) {
+                            btn.innerText = "显示航迹";
+                            btn.style.background = "#34495e";
+                        }
+                    } else {
+                        // 如果不存在，则请求获取（显示）
+                        // 互斥逻辑：先清除其他所有航迹
+                        for (var key in window.flightPaths) {
+                            map.removeLayer(window.flightPaths[key]);
+                            delete window.flightPaths[key];
+                            // 重置对应按钮状态
+                            var otherBtn = document.getElementById('btn-' + key);
+                            if(otherBtn) {
+                                otherBtn.innerText = "显示航迹";
+                                otherBtn.style.background = "#34495e";
+                            }
+                        }
+                        
+                        if (window.bridge) window.bridge.get_flight_path(callsign);
+                        // 不再显示"加载中..."，保持原样直到数据返回
+                    }
+                };
+
+                // 生成随机颜色 (H:0-360, S:70-100%, L:50-60%)
+                function getRandomColor() {
+                    var h = Math.floor(Math.random() * 360);
+                    return 'hsl(' + h + ', 100%, 50%)';
+                }
+
+                drawPath = function(data) {
+                    var callsign = data.callsign;
+                    var pathData = data.path;
+                    
+                    // 再次确保互斥：清除所有现有航迹
+                    for (var key in window.flightPaths) {
+                        map.removeLayer(window.flightPaths[key]);
+                        delete window.flightPaths[key];
+                        var otherBtn = document.getElementById('btn-' + key);
+                        if(otherBtn) {
+                            otherBtn.innerText = "显示航迹";
+                            otherBtn.style.background = "#34495e";
+                        }
+                    }
+                    
+                    var latlngs = pathData.map(p => [p.latitude, p.longitude]);
+                    // 生成一个均匀的随机颜色
+                    var color = getRandomColor();
+                    
+                    // 绘制整条均匀颜色的航迹
+                    var polyline = L.polyline(latlngs, {color: color, weight: 4, opacity: 0.8}).addTo(map);
+                    window.flightPaths[callsign] = polyline;
+                    map.fitBounds(polyline.getBounds());
+                    
+                    // 更新按钮状态
+                    var btn = document.getElementById('btn-' + callsign);
+                    if(btn) {
+                        btn.innerText = "隐藏航迹";
+                        btn.style.background = "#c0392b";
+                    }
+                };
+
+                // 最后再初始化通信
+                new QWebChannel(qt.webChannelTransport, function(channel) {
+                    window.bridge = channel.objects.bridge;
+                    
+                    // 监听 Python 信号
+                    window.bridge.updatePilotsSignal.connect(function(jsonData) {
+                        var pilots = JSON.parse(jsonData);
+                        updatePilots(pilots);
+                    });
+                    
+                    window.bridge.drawPathSignal.connect(function(jsonData) {
+                        var pathData = JSON.parse(jsonData);
+                        drawPath(pathData);
+                    });
+
+                    // 通知 Python 端 JS 已就绪
+                    if (window.bridge) window.bridge.map_ready();
+                });
+            </script>
+        </body>
+        </html>
+        """
+        self.map_view.setHtml(html_content)
+        layout.addWidget(self.map_view)
+        
+        # 定时刷新地图
+        self.map_timer = QTimer(self)
+        self.map_timer.setInterval(15000) # 15秒刷新一次
+        self.map_timer.timeout.connect(self.load_map_data)
+        self.map_timer.start()
+        
+        return widget
+
+    def load_map_data(self):
+        # 使用 /clients 接口获取所有在线客户端
+        self.map_data_thread = APIThread(f"{ISFP_API_BASE}/clients")
+        self.map_data_thread.finished.connect(self.on_map_data_ready)
+        self.manage_thread(self.map_data_thread)
+
+    def on_map_data_ready(self, data):
+        # 如果 JS 还没加载完，直接跳过
+        if not getattr(self, '_map_js_ready', False):
+            return
+
+        # 获取 pilots 数据
+        pilots = data.get("pilots", [])
+        
+        # 转换数据为 JS 友好的格式
+        js_data = []
+        for p in pilots:
+            fp = p.get("flight_plan") or {}
+            js_data.append({
+                "cid": p.get("cid"),
+                "callsign": p.get("callsign"),
+                "latitude": p.get("latitude"),
+                "longitude": p.get("longitude"),
+                "heading": p.get("heading", 0),
+                "altitude": p.get("altitude", 0),
+                "ground_speed": p.get("ground_speed", 0),
+                "transponder": p.get("transponder", "----"),
+                "aircraft": fp.get("aircraft", "Unknown")
+            })
+        
+        # 改用信号机制推送数据，不再直接调用 runJavaScript
+        import json
+        json_str = json.dumps(js_data)
+        self.map_bridge.updatePilotsSignal.emit(json_str)
+
+    def fetch_flight_path(self, callsign):
+        self.path_thread = APIThread(
+            f"{ISFP_API_BASE}/clients/paths/{callsign}",
+            headers={"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {}
+        )
+        self.path_thread.finished.connect(self.on_path_ready)
+        self.manage_thread(self.path_thread)
+
+    def on_path_ready(self, data):
+        if data.get("code") == "200" or isinstance(data.get("data"), list):
+            path_data = data.get("data", [])
+            import json
+            # 改用信号推送航迹数据，同时带上呼号以便 JS 区分
+            # 这里我们需要从请求参数中找回 callsign，或者让 APIThread 返回它
+            # 由于 APIThread 不返回原始参数，我们从 url 中解析 callsign
+            # URL 格式: .../clients/paths/{callsign}
+            callsign = self.sender().url.split('/')[-1]
+            
+            payload = {
+                "callsign": callsign,
+                "path": path_data
+            }
+            self.map_bridge.drawPathSignal.emit(json.dumps(payload))
+        else:
+            self.show_notification("获取航迹失败或未登录")
 
     def create_activities_tab(self):
         widget = QWidget()
@@ -744,6 +1049,47 @@ class ISFPApp(QMainWindow):
             }
         """)
         login_btn.clicked.connect(self.handle_login)
+        
+        # 记住我复选框
+        self.remember_me_cb = QCheckBox("记住我")
+        # 修复：显式设置勾选状态的图标，这里用文字 √ 代替图片，确保可见
+        self.remember_me_cb.setStyleSheet("""
+            QCheckBox { 
+                color: #ccc; 
+                font-size: 13px; 
+                background: transparent; 
+                spacing: 5px;
+            }
+            QCheckBox::indicator { 
+                width: 18px; 
+                height: 18px; 
+                border-radius: 4px; 
+                border: 1px solid #555; 
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            QCheckBox::indicator:checked { 
+                background-color: #3498db; 
+                border-color: #3498db; 
+                image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjMiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBvbHlsaW5lIHBvaW50cz0iMjAgNiA5IDE3IDQgMTIiPjwvcG9seWxpbmU+PC9zdmc+);
+            }
+            QCheckBox::indicator:hover {
+                border-color: #3498db;
+            }
+        """)
+        self.remember_me_cb.setCursor(Qt.PointingHandCursor)
+        
+        # 加载保存的凭据
+        if self.settings.value("remember_me", False, type=bool):
+            self.remember_me_cb.setChecked(True)
+            self.login_user.setText(self.settings.value("username", ""))
+            self.login_pass.setText(self.settings.value("password", ""))
+        
+        # 按钮行布局
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.addWidget(self.remember_me_cb)
+        
+        layout.addLayout(btn_layout)
         layout.addWidget(login_btn)
 
         reg_btn = QPushButton("没有账号？立即注册")
@@ -981,8 +1327,19 @@ class ISFPApp(QMainWindow):
 
     def on_login_finished(self, data):
         if data.get("code") == "LOGIN_SUCCESS":
-            self.auth_token = data["data"].get("token")
-            self.user_data = data["data"]
+            self.auth_token = data.get("data", {}).get("token")
+            self.user_data = data.get("data")
+            
+            # 处理“记住我”逻辑
+            if self.remember_me_cb.isChecked():
+                self.settings.setValue("remember_me", True)
+                self.settings.setValue("username", self.login_user.text().strip())
+                self.settings.setValue("password", self.login_pass.text().strip())
+            else:
+                self.settings.setValue("remember_me", False)
+                self.settings.remove("username")
+                self.settings.remove("password")
+            
             self.update_account_ui()
             self.show_notification("登录成功！")
             # 登录后刷新活动和工单
