@@ -108,7 +108,7 @@ class ISFPApp(QMainWindow):
         # 设置 16:9 比例 (例如 1280x720)
         self.win_width = 1280
         self.win_height = 720
-        self.setFixedSize(self.win_width, self.win_height)
+        self.resize(self.win_width, self.win_height) # 移除固定大小限制，允许调整
         
         # 用户认证数据
         self.auth_token = None
@@ -2131,6 +2131,11 @@ class ISFPApp(QMainWindow):
 
     def display_pilots(self, data):
         pilots = data.get("pilots", [])
+        
+        # 兼容处理：如果数据在 data.data.pilots
+        if not pilots and "data" in data and isinstance(data["data"], dict):
+            pilots = data["data"].get("pilots", [])
+            
         self.online_list.setStyleSheet("""
             QListWidget {
                 background: rgba(0,0,0,120); 
@@ -2150,6 +2155,15 @@ class ISFPApp(QMainWindow):
                 border: 1px solid #3498db;
             }
         """)
+        
+        if not pilots:
+            item = QListWidgetItem("✈️ 暂无机组在线")
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setForeground(QColor("#bdc3c7"))
+            item.setSizeHint(QSize(0, 50))
+            self.online_list.addItem(item)
+            return
+
         for p in pilots:
             # 修复：fp 可能为 None，需要提供默认字典
             fp = p.get("flight_plan") or {}
