@@ -232,6 +232,7 @@ class ISFPApp(QMainWindow):
         self.tabs.addTab(self.create_weather_tab(), "气象")
         self.tabs.addTab(self.create_map_tab(), "地图") # 新增连飞地图
         self.tabs.addTab(self.create_online_tab(), "在线")
+        self.tabs.addTab(self.create_rating_tab(), "排行") # 新增排行榜
         self.tabs.addTab(self.create_flight_plan_tab(), "计划")
         self.tabs.addTab(self.create_activities_tab(), "活动")
         self.tabs.addTab(self.create_ticket_tab(), "工单")
@@ -250,6 +251,8 @@ class ISFPApp(QMainWindow):
             self.load_activities()
         elif tab_name == "地图":
             self.load_map_data()
+        elif tab_name == "排行":
+            self.load_ratings()
 
     def create_map_tab(self):
         widget = QWidget()
@@ -1652,9 +1655,114 @@ class ISFPApp(QMainWindow):
 
         self.online_list = QListWidget()
         self.online_list.setStyleSheet("background: rgba(0,0,0,100); border-radius: 10px; color: white; padding: 5px;")
+        
         layout.addWidget(self.online_list)
         
         return widget
+
+    def create_rating_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # 顶部栏
+        header = QHBoxLayout()
+        title = QLabel("🏆 服务器时长排行榜 (Server Rating)")
+        title.setStyleSheet("color: #f1c40f; font-size: 20px; font-weight: bold;")
+        
+        refresh_btn = QPushButton("刷新数据")
+        refresh_btn.clicked.connect(self.load_ratings)
+        refresh_btn.setStyleSheet("background: rgba(241, 196, 15, 0.2); color: #f1c40f; border: 1px solid #f1c40f; border-radius: 5px; padding: 5px 15px;")
+        
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(refresh_btn)
+        layout.addLayout(header)
+        
+        # 内容区 - 双列布局
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(20)
+        
+        # 飞行员排行
+        pilot_group = QFrame()
+        pilot_group.setStyleSheet("background: rgba(0,0,0,100); border-radius: 10px; padding: 10px;")
+        pilot_layout = QVBoxLayout(pilot_group)
+        
+        p_title = QLabel("✈️ 飞行员时长排行 (Top Pilots)")
+        p_title.setStyleSheet("color: #3498db; font-weight: bold; font-size: 16px; margin-bottom: 10px;")
+        pilot_layout.addWidget(p_title)
+        
+        self.pilot_rating_list = QListWidget()
+        self.pilot_rating_list.setStyleSheet("background: transparent; border: none;")
+        pilot_layout.addWidget(self.pilot_rating_list)
+        
+        # 管制员排行
+        atc_group = QFrame()
+        atc_group.setStyleSheet("background: rgba(0,0,0,100); border-radius: 10px; padding: 10px;")
+        atc_layout = QVBoxLayout(atc_group)
+        
+        a_title = QLabel("📡 管制员时长排行 (Top ATC)")
+        a_title.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 16px; margin-bottom: 10px;")
+        atc_layout.addWidget(a_title)
+        
+        self.atc_rating_list = QListWidget()
+        self.atc_rating_list.setStyleSheet("background: transparent; border: none;")
+        atc_layout.addWidget(self.atc_rating_list)
+        
+        content_layout.addWidget(pilot_group)
+        content_layout.addWidget(atc_group)
+        layout.addLayout(content_layout)
+        
+        return widget
+
+    def load_ratings(self):
+        if not self.auth_token:
+            self.show_notification("请先登录后查看排行榜")
+            return
+            
+        self.rating_thread = APIThread(
+            f"{ISFP_API_BASE}/server/rating",
+            headers={"Authorization": f"Bearer {self.auth_token}"}
+        )
+        self.rating_thread.finished.connect(self.display_ratings)
+        self.manage_thread(self.rating_thread)
+
+    def display_ratings(self, data):
+        if data.get("code") != "GET_TIME_RATING":
+            self.show_notification(f"获取排行失败: {data.get('message')}")
+            return
+            
+        pilots = data.get("data", {}).get("pilots", [])
+        controllers = data.get("data", {}).get("controllers", [])
+        
+        # 辅助函数：格式化时间
+        def format_time(seconds):
+            h = seconds // 3600
+            m = (seconds % 3600) // 60
+            return f"{h}h {m}m"
+            
+        # 填充列表
+        self.pilot_rating_list.clear()
+        for i, p in enumerate(pilots):
+            rank = i + 1
+            color = "#f1c40f" if rank == 1 else "#bdc3c7" if rank == 2 else "#e67e22" if rank == 3 else "white"
+            icon = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
+            
+            item = QListWidgetItem(f"{icon} CID: {p['cid']} - {format_time(p['time'])}")
+            item.setForeground(QColor(color))
+            item.setFont(QFont("Consolas", 14 if rank <= 3 else 12))
+            self.pilot_rating_list.addItem(item)
+            
+        self.atc_rating_list.clear()
+        for i, c in enumerate(controllers):
+            rank = i + 1
+            color = "#f1c40f" if rank == 1 else "#bdc3c7" if rank == 2 else "#e67e22" if rank == 3 else "white"
+            icon = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
+            
+            item = QListWidgetItem(f"{icon} CID: {c['cid']} - {format_time(c['time'])}")
+            item.setForeground(QColor(color))
+            item.setFont(QFont("Consolas", 14 if rank <= 3 else 12))
+            self.atc_rating_list.addItem(item)
 
     def create_flight_plan_tab(self):
         widget = QWidget()
