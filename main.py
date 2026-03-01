@@ -2,11 +2,16 @@ import sys
 import requests
 import ctypes
 import time
+import json
+import os
+import shutil
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLineEdit, QPushButton, QTextEdit, 
                              QLabel, QTabWidget, QListWidget, QListWidgetItem,
                              QScrollArea, QFrame, QGraphicsBlurEffect, QSplitter,
-                             QDialog, QCheckBox)
+                             QDialog, QCheckBox, QFileDialog, QComboBox, QDateEdit, 
+                             QTimeEdit, QSpinBox, QFormLayout, QGroupBox, QAbstractSpinBox,
+                             QGridLayout)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal, QUrl, QObject, Slot, QSettings
 from PySide6.QtGui import QPixmap, QIcon, QFont, QPalette, QColor, QBrush, QImage, QPainter, QPainterPath, QPen
@@ -78,6 +83,60 @@ def debounce(wait_ms=500):
         return wrapper
     return decorator
 
+class DispatchManager:
+    """ 签派数据管理器：处理机库和航班历史 """
+    def __init__(self, data_dir="data"):
+        self.data_dir = data_dir
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+        self.hangar_file = os.path.join(data_dir, "hangar.json")
+        self.history_file = os.path.join(data_dir, "flight_history.json")
+        self.hangar = self.load_json(self.hangar_file)
+        self.history = self.load_json(self.history_file)
+
+    def load_json(self, path):
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return []
+        return []
+
+    def save_json(self, path, data):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
+    def add_aircraft(self, aircraft):
+        self.hangar.append(aircraft)
+        self.save_json(self.hangar_file, self.hangar)
+
+    def add_flight(self, flight):
+        self.history.insert(0, flight) # 最新航班排前面
+        self.save_json(self.history_file, self.history)
+
+    def delete_flight(self, flight):
+        if flight in self.history:
+            self.history.remove(flight)
+            self.save_json(self.history_file, self.history)
+
+    def clear_history(self):
+        self.history = []
+        self.save_json(self.history_file, self.history)
+
+    def delete_aircraft(self, aircraft):
+        # 使用注册号作为唯一标识尝试删除，或者直接比较字典
+        #由于字典比较是完全匹配，可以直接用 remove
+        if aircraft in self.hangar:
+            self.hangar.remove(aircraft)
+            self.save_json(self.hangar_file, self.hangar)
+
+    def update_aircraft(self, old_data, new_data):
+        if old_data in self.hangar:
+            index = self.hangar.index(old_data)
+            self.hangar[index] = new_data
+            self.save_json(self.hangar_file, self.hangar)
+
 class MapBridge(QObject):
     """ 连飞地图 JS 交互桥接 """
     # 定义信号，用于从 Python 向 JS 推送数据
@@ -98,6 +157,246 @@ class MapBridge(QObject):
         self.app._map_js_ready = True
         # 立即触发一次数据加载
         QTimer.singleShot(100, self.app.load_map_data)
+
+class AddAircraftDialog(QDialog):
+    def __init__(self, parent=None, aircraft_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("修改航空器" if aircraft_data else "添加航空器")
+        self.setFixedSize(400, 300)
+        self.parent_app = parent
+        self.image_path = None
+        self.aircraft_data = aircraft_data
+        
+        layout = QFormLayout(self)
+        
+        self.type_input = QLineEdit()
+        layout.addRow("机型 (Type):", self.type_input)
+        
+        self.reg_input = QLineEdit()
+        layout.addRow("注册号 (Reg):", self.reg_input)
+        
+        self.airline_input = QLineEdit()
+        layout.addRow("航司 (ICAO):", self.airline_input)
+        
+        # 图片选择
+        img_layout = QHBoxLayout()
+        self.img_label = QLabel("未选择图片")
+        self.img_label.setStyleSheet("color: #aaa;")
+        btn_select = QPushButton("选择图片")
+        btn_select.clicked.connect(self.select_image)
+        img_layout.addWidget(self.img_label)
+        img_layout.addWidget(btn_select)
+        layout.addRow("飞机图片:", img_layout)
+        
+        self.status_label = QLabel("若不上传图片，将自动从网络获取")
+        self.status_label.setStyleSheet("color: #f39c12; font-size: 12px;")
+        layout.addRow(self.status_label)
+        
+        # 填充数据
+        if aircraft_data:
+            self.type_input.setText(aircraft_data.get('type', ''))
+            self.reg_input.setText(aircraft_data.get('reg', ''))
+            self.airline_input.setText(aircraft_data.get('airline', ''))
+            if aircraft_data.get('image'):
+                self.image_path = aircraft_data['image']
+                self.img_label.setText(os.path.basename(self.image_path))
+        
+        # 按钮
+        btn_box = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addWidget(save_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addRow(btn_box)
+        
+        # 样式
+        self.setStyleSheet("""
+            QDialog { background: #2c3e50; color: white; }
+            QLineEdit { padding: 5px; border-radius: 4px; border: 1px solid #555; background: #34495e; color: white; }
+            QPushButton { padding: 5px 15px; background: #3498db; color: white; border: none; border-radius: 4px; }
+            QPushButton:hover { background: #2980b9; }
+            QLabel { color: white; }
+        """)
+
+    def select_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择飞机图片", "", "Images (*.png *.jpg *.jpeg)")
+        if path:
+            self.image_path = path
+            self.img_label.setText(os.path.basename(path))
+
+    def get_data(self):
+        return {
+            "type": self.type_input.text().strip().upper(),
+            "reg": self.reg_input.text().strip().upper(),
+            "airline": self.airline_input.text().strip().upper(),
+            "image": self.image_path
+        }
+
+class NewFlightDialog(QDialog):
+    def __init__(self, hangar, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("新建航班")
+        self.resize(500, 600)
+        self.hangar = hangar
+        
+        layout = QFormLayout(self)
+        
+        self.callsign_input = QLineEdit()
+        layout.addRow("航班号:", self.callsign_input)
+        
+        self.dep_input = QLineEdit()
+        layout.addRow("出发机场 (ICAO):", self.dep_input)
+        
+        self.arr_input = QLineEdit()
+        layout.addRow("到达机场 (ICAO):", self.arr_input)
+        
+        self.aircraft_combo = QComboBox()
+        for ac in hangar:
+            self.aircraft_combo.addItem(f"{ac['reg']} - {ac['type']}", ac)
+        layout.addRow("选择航空器:", self.aircraft_combo)
+        
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm")
+        self.time_edit.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("计划起飞时间:", self.time_edit)
+        
+        self.arr_time_edit = QTimeEdit()
+        self.arr_time_edit.setDisplayFormat("HH:mm")
+        self.arr_time_edit.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("计划落地时间:", self.arr_time_edit)
+        
+        self.alt_spin = QSpinBox()
+        self.alt_spin.setRange(0, 60000)
+        self.alt_spin.setValue(30000)
+        self.alt_spin.setSingleStep(1000)
+        self.alt_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("巡航高度 (ft):", self.alt_spin)
+        
+        self.ci_spin = QSpinBox()
+        self.ci_spin.setRange(0, 999)
+        self.ci_spin.setValue(30)
+        self.ci_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("成本指数 (CI):", self.ci_spin)
+        
+        self.pax_spin = QSpinBox()
+        self.pax_spin.setRange(0, 800)
+        self.pax_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("乘客数:", self.pax_spin)
+        
+        hbox_taxi = QHBoxLayout()
+        self.taxi_out = QSpinBox()
+        self.taxi_out.setSuffix(" min")
+        self.taxi_out.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.taxi_in = QSpinBox()
+        self.taxi_in.setSuffix(" min")
+        self.taxi_in.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        hbox_taxi.addWidget(QLabel("起飞滑行时间:"))
+        hbox_taxi.addWidget(self.taxi_out)
+        hbox_taxi.addWidget(QLabel("落地滑行时间:"))
+        hbox_taxi.addWidget(self.taxi_in)
+        layout.addRow("滑行时间:", hbox_taxi)
+        
+        self.payload_spin = QSpinBox()
+        self.payload_spin.setRange(0, 500000)
+        self.payload_spin.setSuffix(" kg")
+        self.payload_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("载荷:", self.payload_spin)
+        
+        self.extra_fuel = QSpinBox()
+        self.extra_fuel.setSuffix(" min")
+        self.extra_fuel.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        layout.addRow("备用燃油:", self.extra_fuel)
+        
+        self.route_input = QTextEdit()
+        self.route_input.setMaximumHeight(80)
+        layout.addRow("飞行航路:", self.route_input)
+        
+        # 按钮
+        btn_box = QHBoxLayout()
+        save_btn = QPushButton("创建新航班")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addWidget(save_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addRow(btn_box)
+        
+        self.setStyleSheet("""
+            QDialog { background: #2c3e50; color: white; }
+            QLineEdit, QComboBox, QTimeEdit, QSpinBox, QTextEdit { 
+                padding: 5px; border-radius: 4px; border: 1px solid #555; background: #34495e; color: white; 
+            }
+            QPushButton { padding: 8px 20px; background: #27ae60; color: white; border: none; border-radius: 4px; font-weight: bold; }
+            QPushButton:hover { background: #2ecc71; }
+            QLabel { color: white; }
+        """)
+
+    def get_data(self):
+        ac_data = self.aircraft_combo.currentData()
+        return {
+            "callsign": self.callsign_input.text().upper(),
+            "dep": self.dep_input.text().upper(),
+            "arr": self.arr_input.text().upper(),
+            "aircraft": ac_data,
+            "etd": self.time_edit.text(),
+            "eta": self.arr_time_edit.text(),
+            "altitude": self.alt_spin.value(),
+            "ci": self.ci_spin.value(),
+            "pax": self.pax_spin.value(),
+            "taxi_out": self.taxi_out.value(),
+            "taxi_in": self.taxi_in.value(),
+            "payload": self.payload_spin.value(),
+            "extra_fuel": self.extra_fuel.value(),
+            "route": self.route_input.toPlainText(),
+            "date": time.strftime("%Y-%m-%d")
+        }
+
+class FlightDetailsDialog(QDialog):
+    def __init__(self, flight, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"航班详情 - {flight.get('callsign')}")
+        self.resize(400, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        # 标题
+        title = QLabel(f"{flight.get('dep')} ✈ {flight.get('arr')}")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #3498db; margin: 10px;")
+        layout.addWidget(title)
+        
+        # 详细信息
+        form = QFormLayout()
+        form.setSpacing(15)
+        
+        def add_row(label, value):
+            lbl = QLabel(label)
+            val = QLabel(str(value))
+            lbl.setStyleSheet("color: #bdc3c7; font-weight: bold;")
+            val.setStyleSheet("color: white;")
+            form.addRow(lbl, val)
+            
+        add_row("航班号:", flight.get('callsign'))
+        add_row("日期:", flight.get('date'))
+        add_row("机型:", flight.get('aircraft', {}).get('type', 'Unknown'))
+        add_row("注册号:", flight.get('aircraft', {}).get('reg', 'Unknown'))
+        add_row("计划起飞:", flight.get('etd'))
+        add_row("计划落地:", flight.get('eta', '--:--'))
+        add_row("巡航高度:", f"{flight.get('altitude')} ft")
+        add_row("乘客:", flight.get('pax'))
+        add_row("载荷:", f"{flight.get('payload')} kg")
+        add_row("航路:", flight.get('route'))
+        
+        layout.addLayout(form)
+        
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        close_btn.setStyleSheet("margin-top: 20px; padding: 8px; background: #34495e; color: white; border-radius: 4px;")
+        layout.addWidget(close_btn)
+        
+        self.setStyleSheet("QDialog { background: #2c3e50; }")
 
 class ISFPApp(QMainWindow):
     def __init__(self):
@@ -120,10 +419,33 @@ class ISFPApp(QMainWindow):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
         self.settings = QSettings(config_path, QSettings.IniFormat)
         
+        # 签派数据管理器
+        self.dispatch_manager = DispatchManager(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+        
         # 线程管理器，防止 QThread 被 GC 回收
         self._active_threads = set()
         
         self.setup_ui()
+
+    def resizeEvent(self, event):
+        """ 处理窗口大小调整事件 """
+        new_size = event.size()
+        
+        # 调整背景和遮罩层
+        if hasattr(self, 'bg_label'):
+            self.bg_label.setGeometry(0, 0, new_size.width(), new_size.height())
+            if hasattr(self, 'bg_pixmap') and not self.bg_pixmap.isNull():
+                self.bg_label.setPixmap(self.bg_pixmap.scaled(
+                    new_size.width(), 
+                    new_size.height(), 
+                    Qt.KeepAspectRatioByExpanding, 
+                    Qt.SmoothTransformation
+                ))
+                
+        if hasattr(self, 'bg_overlay'):
+            self.bg_overlay.setGeometry(0, 0, new_size.width(), new_size.height())
+            
+        super().resizeEvent(event)
 
     def manage_thread(self, thread):
         """ 托管线程生命周期，防止被 GC 回收导致崩溃 """
@@ -140,9 +462,11 @@ class ISFPApp(QMainWindow):
         # 主窗口背景
         self.bg_label = QLabel(self)
         self.bg_label.setGeometry(0, 0, self.win_width, self.win_height)
-        pixmap = QPixmap("assets/background.png")
-        if not pixmap.isNull():
-            self.bg_label.setPixmap(pixmap.scaled(self.win_width, self.win_height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+        
+        # 保存原始 Pixmap 以便后续缩放
+        self.bg_pixmap = QPixmap("assets/background.png")
+        if not self.bg_pixmap.isNull():
+            self.bg_label.setPixmap(self.bg_pixmap.scaled(self.win_width, self.win_height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
         else:
             self.bg_label.setStyleSheet("background-color: #1a1a1a;")
 
@@ -233,6 +557,7 @@ class ISFPApp(QMainWindow):
         self.tabs.addTab(self.create_map_tab(), "地图") # 新增连飞地图
         self.tabs.addTab(self.create_online_tab(), "在线")
         self.tabs.addTab(self.create_rating_tab(), "排行") # 新增排行榜
+        self.tabs.addTab(self.create_dispatch_tab(), "签派") # 新增签派
         self.tabs.addTab(self.create_flight_plan_tab(), "计划")
         self.tabs.addTab(self.create_activities_tab(), "活动")
         self.tabs.addTab(self.create_ticket_tab(), "工单")
@@ -253,6 +578,394 @@ class ISFPApp(QMainWindow):
             self.load_map_data()
         elif tab_name == "排行":
             self.load_ratings()
+        elif tab_name == "签派":
+            self.load_dispatch_data()
+        elif tab_name == "计划":
+            self.load_server_flight_plan()
+
+    def create_dispatch_tab(self):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(20)
+        
+        # 左侧：我的机库
+        hangar_group = QGroupBox("我的机库 (My Hangar)")
+        hangar_group.setStyleSheet("""
+            QGroupBox { 
+                color: #f39c12; 
+                font-weight: bold; 
+                font-size: 16px;
+                border: 2px solid #f39c12; 
+                border-radius: 8px; 
+                margin-top: 15px; 
+                background: rgba(0, 0, 0, 0.3);
+            } 
+            QGroupBox::title { 
+                subcontrol-origin: margin; 
+                left: 15px; 
+                padding: 0 5px; 
+            }
+        """)
+        hangar_layout = QVBoxLayout(hangar_group)
+        hangar_layout.setContentsMargins(15, 25, 15, 15)
+        
+        # 使用 IconMode 展示机库
+        self.hangar_list = QListWidget()
+        self.hangar_list.setViewMode(QListWidget.IconMode)
+        self.hangar_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.hangar_list.customContextMenuRequested.connect(self.show_hangar_menu)
+        self.hangar_list.setIconSize(QSize(220, 150))
+        self.hangar_list.setSpacing(10)
+        self.hangar_list.setResizeMode(QListWidget.Adjust)
+        self.hangar_list.setStyleSheet("""
+            QListWidget {
+                background: transparent; 
+                border: none;
+            }
+            QListWidget::item {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 8px;
+                padding: 5px;
+                color: white;
+                margin: 5px;
+            }
+            QListWidget::item:hover {
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid #f39c12;
+            }
+            QListWidget::item:selected {
+                background: rgba(243, 156, 18, 0.2);
+                border: 1px solid #f39c12;
+            }
+        """)
+        hangar_layout.addWidget(self.hangar_list)
+        
+        add_ac_btn = QPushButton("➕ 添加航空器")
+        add_ac_btn.setStyleSheet("""
+            QPushButton {
+                background: #2980b9; 
+                color: white; 
+                padding: 12px; 
+                border-radius: 6px; 
+                font-size: 14px; 
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #3498db;
+            }
+        """)
+        add_ac_btn.clicked.connect(self.show_add_aircraft_dialog)
+        hangar_layout.addWidget(add_ac_btn)
+        
+        layout.addWidget(hangar_group, 6) # 占比 60%
+        
+        # 右侧：航班签派
+        flight_group = QGroupBox("航班签派 (Dispatch)")
+        flight_group.setStyleSheet("""
+            QGroupBox { 
+                color: #2ecc71; 
+                font-weight: bold; 
+                font-size: 16px;
+                border: 2px solid #2ecc71; 
+                border-radius: 8px; 
+                margin-top: 15px; 
+                background: rgba(0, 0, 0, 0.3);
+            } 
+            QGroupBox::title { 
+                subcontrol-origin: margin; 
+                left: 15px; 
+                padding: 0 5px; 
+            }
+        """)
+        flight_layout = QVBoxLayout(flight_group)
+        flight_layout.setContentsMargins(15, 25, 15, 15)
+        
+        new_flight_btn = QPushButton("🛫 新建航班")
+        new_flight_btn.setStyleSheet("""
+            QPushButton {
+                background: #27ae60; 
+                color: white; 
+                padding: 12px; 
+                border-radius: 6px; 
+                font-size: 14px; 
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #2ecc71;
+            }
+        """)
+        new_flight_btn.clicked.connect(self.show_new_flight_dialog)
+        flight_layout.addWidget(new_flight_btn)
+        
+        # 历史记录头部工具栏
+        hist_header = QHBoxLayout()
+        history_label = QLabel("📋 历史航班记录")
+        history_label.setStyleSheet("color: #bdc3c7; font-size: 13px;")
+        hist_header.addWidget(history_label)
+        hist_header.addStretch()
+        
+        clear_hist_btn = QPushButton("清空")
+        clear_hist_btn.setCursor(Qt.PointingHandCursor)
+        clear_hist_btn.setFixedSize(50, 24)
+        clear_hist_btn.setToolTip("清空所有历史记录")
+        clear_hist_btn.setStyleSheet("""
+            QPushButton { background: rgba(192, 57, 43, 0.8); color: white; border-radius: 4px; font-size: 12px; border: none; }
+            QPushButton:hover { background: #e74c3c; }
+        """)
+        clear_hist_btn.clicked.connect(self.confirm_clear_history)
+        hist_header.addWidget(clear_hist_btn)
+        
+        flight_layout.addLayout(hist_header)
+        
+        self.flight_history_list = QListWidget()
+        self.flight_history_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.flight_history_list.customContextMenuRequested.connect(self.show_history_menu)
+        self.flight_history_list.setStyleSheet("""
+            QListWidget {
+                background: rgba(0,0,0,0.2); 
+                border: 1px solid rgba(255,255,255,0.1); 
+                border-radius: 6px;
+            }
+            QListWidget::item {
+                padding: 10px;
+                border-bottom: 1px solid rgba(255,255,255,0.05);
+            }
+            QListWidget::item:hover {
+                background: rgba(255, 255, 255, 0.05);
+            }
+            QListWidget::item:selected {
+                background: rgba(46, 204, 113, 0.2);
+                border-left: 3px solid #2ecc71;
+            }
+        """)
+        self.flight_history_list.itemClicked.connect(self.show_flight_details)
+        flight_layout.addWidget(self.flight_history_list)
+        
+        layout.addWidget(flight_group, 4) # 占比 40%
+        
+        return widget
+
+    def confirm_clear_history(self):
+        from PySide6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(self, "确认清空", "确定要删除所有航班历史记录吗？此操作不可恢复。",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.dispatch_manager.clear_history()
+            self.load_dispatch_data()
+            self.show_notification("历史记录已清空")
+
+    def load_dispatch_data(self):
+        # 加载机库
+        self.hangar_list.clear()
+        hangar = self.dispatch_manager.hangar
+        for ac in hangar:
+            # 优先使用图片，如果没有则显示默认图标
+            if ac.get('image') and os.path.exists(ac['image']):
+                icon = QIcon(ac['image'])
+            else:
+                # 动态生成占位图
+                pix = QPixmap(220, 150)
+                pix.fill(QColor(44, 62, 80))
+                painter = QPainter(pix)
+                painter.setPen(QPen(Qt.white))
+                painter.setFont(QFont("Arial", 14, QFont.Bold))
+                painter.drawText(pix.rect(), Qt.AlignCenter, "NO IMAGE")
+                painter.end()
+                icon = QIcon(pix)
+            
+            text = f"{ac['airline']} {ac['reg']}\n{ac['type']}"
+            item = QListWidgetItem(icon, text)
+            item.setForeground(Qt.white)
+            item.setFont(QFont("Consolas", 10, QFont.Bold))
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setData(Qt.UserRole, ac)
+            self.hangar_list.addItem(item)
+            
+        # 加载历史
+        self.flight_history_list.clear()
+        history = self.dispatch_manager.history
+        for f in history:
+            # 格式化显示：日期 | 航班号 | 起降 | 机型
+            text = f"📅 {f['date']}   ✈ {f['callsign']}\n" \
+                   f"🛫 {f['dep']} ➔ 🛬 {f['arr']}   🛩️ {f['aircraft']['type']}"
+            item = QListWidgetItem(text)
+            item.setForeground(Qt.white)
+            item.setFont(QFont("Consolas", 10))
+            item.setData(Qt.UserRole, f) # 存储完整数据以便点击查看
+            self.flight_history_list.addItem(item)
+
+    def show_history_menu(self, pos):
+        item = self.flight_history_list.itemAt(pos)
+        if not item: return
+        
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu { background: #2c3e50; color: white; border: 1px solid #555; }
+            QMenu::item { padding: 5px 20px; }
+            QMenu::item:selected { background: #e74c3c; }
+        """)
+        
+        del_action = menu.addAction("🗑️ 删除此记录")
+        action = menu.exec(self.flight_history_list.mapToGlobal(pos))
+        
+        if action == del_action:
+            flight_data = item.data(Qt.UserRole)
+            self.dispatch_manager.delete_flight(flight_data)
+            self.load_dispatch_data()
+            self.show_notification("航班记录已删除")
+
+    def show_hangar_menu(self, pos):
+        item = self.hangar_list.itemAt(pos)
+        if not item: return
+        
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu { background: #2c3e50; color: white; border: 1px solid #555; }
+            QMenu::item { padding: 5px 20px; }
+            QMenu::item:selected { background: #3498db; }
+        """)
+        
+        edit_action = menu.addAction("✏️ 修改信息")
+        del_action = menu.addAction("🗑️ 删除航空器")
+        
+        action = menu.exec(self.hangar_list.mapToGlobal(pos))
+        
+        if action == edit_action:
+            self.show_edit_aircraft_dialog(item)
+        elif action == del_action:
+            from PySide6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(self, "确认删除", "确定要删除该航空器吗？",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                aircraft_data = item.data(Qt.UserRole)
+                self.dispatch_manager.delete_aircraft(aircraft_data)
+                self.load_dispatch_data()
+                self.show_notification("航空器已删除")
+
+    def show_edit_aircraft_dialog(self, item):
+        original_data = item.data(Qt.UserRole)
+        dialog = AddAircraftDialog(self, aircraft_data=original_data)
+        if dialog.exec():
+            new_data = dialog.get_data()
+            # 如果没有上传新图片且原图片存在，保持原图片
+            if not new_data['image'] and original_data.get('image'):
+                 new_data['image'] = original_data['image']
+            
+            # 同样处理自动获取图片逻辑
+            if not new_data['image']:
+                 # 如果是修改，且原本也没图，或者虽然是修改但没图且想重新获取...
+                 # 简单起见，如果没有图，就尝试获取
+                 reg = new_data['reg']
+                 def on_photo_ready(res):
+                    if isinstance(res, dict) and res.get('success') and res['data'].get('photo_found'):
+                        img_url = res['data'].get('photo_image_url')
+                        if img_url:
+                            try:
+                                headers = {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                                }
+                                import requests
+                                r = requests.get(img_url, headers=headers, timeout=15)
+                                if r.status_code == 200:
+                                    img_dir = os.path.join(self.dispatch_manager.data_dir, "images")
+                                    if not os.path.exists(img_dir):
+                                        os.makedirs(img_dir)
+                                    img_path = os.path.join(img_dir, f"{reg}.jpg")
+                                    with open(img_path, 'wb') as f:
+                                        f.write(r.content)
+                                    
+                                    # 更新数据 (这里稍微复杂，因为我们要更新的是已经修改后的数据)
+                                    # 重新从 hangar 中找
+                                    for ac in self.dispatch_manager.hangar:
+                                        if ac['reg'] == reg: # 假设注册号没改，或者改了之后
+                                            ac['image'] = img_path
+                                            break
+                                    self.dispatch_manager.save_json(self.dispatch_manager.hangar_file, self.dispatch_manager.hangar)
+                                    self.load_dispatch_data()
+                            except Exception as e:
+                                print(f"下载图片失败: {e}")
+
+                 self.auto_photo_thread = APIThread(PLANE_INFO_URL, {"registration": reg})
+                 self.auto_photo_thread.finished.connect(on_photo_ready)
+                 self.manage_thread(self.auto_photo_thread)
+            
+            self.dispatch_manager.update_aircraft(original_data, new_data)
+            self.load_dispatch_data()
+            self.show_notification("航空器信息已更新")
+
+    def show_add_aircraft_dialog(self):
+        dialog = AddAircraftDialog(self)
+        if dialog.exec():
+            data = dialog.get_data()
+            
+            # 如果没有图片，尝试从 API 获取
+            if not data['image']:
+                # 启动线程获取图片 URL
+                # 这里为了简化，我们先保存数据，然后用 APIThread 去更新
+                # 但 DispatchManager 是同步的。
+                # 我们可以先存一个标记，或者在这里阻塞一下（不推荐），或者用 APIThread 回调来更新
+                
+                # 方案：先添加，然后启动线程获取图片，获取成功后更新 JSON
+                self.dispatch_manager.add_aircraft(data)
+                self.load_dispatch_data()
+                
+                # 自动获取图片
+                reg = data['reg']
+                def on_photo_ready(res):
+                    if isinstance(res, dict) and res.get('success') and res['data'].get('photo_found'):
+                        img_url = res['data'].get('photo_image_url')
+                        if img_url:
+                            # 下载图片并保存到本地
+                            try:
+                                headers = {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                                }
+                                import requests
+                                r = requests.get(img_url, headers=headers, timeout=15)
+                                if r.status_code == 200:
+                                    img_dir = os.path.join(self.dispatch_manager.data_dir, "images")
+                                    if not os.path.exists(img_dir):
+                                        os.makedirs(img_dir)
+                                    img_path = os.path.join(img_dir, f"{reg}.jpg")
+                                    with open(img_path, 'wb') as f:
+                                        f.write(r.content)
+                                    
+                                    # 更新数据
+                                    for ac in self.dispatch_manager.hangar:
+                                        if ac['reg'] == reg:
+                                            ac['image'] = img_path
+                                            break
+                                    self.dispatch_manager.save_json(self.dispatch_manager.hangar_file, self.dispatch_manager.hangar)
+                                    self.load_dispatch_data() # 刷新显示
+                            except Exception as e:
+                                print(f"下载图片失败: {e}")
+
+                self.auto_photo_thread = APIThread(PLANE_INFO_URL, {"registration": reg})
+                self.auto_photo_thread.finished.connect(on_photo_ready)
+                self.manage_thread(self.auto_photo_thread)
+            else:
+                self.dispatch_manager.add_aircraft(data)
+                self.load_dispatch_data()
+
+    def show_new_flight_dialog(self):
+        if not self.dispatch_manager.hangar:
+            self.show_notification("机库为空，请先添加航空器")
+            return
+            
+        dialog = NewFlightDialog(self.dispatch_manager.hangar, self)
+        if dialog.exec():
+            data = dialog.get_data()
+            self.dispatch_manager.add_flight(data)
+            self.load_dispatch_data()
+            self.show_notification("航班签派成功，已添加至历史记录")
+
+    def show_flight_details(self, item):
+        flight_data = item.data(Qt.UserRole)
+        dialog = FlightDetailsDialog(flight_data, self)
+        dialog.exec()
 
     def create_map_tab(self):
         widget = QWidget()
@@ -1766,178 +2479,421 @@ class ISFPApp(QMainWindow):
 
     def create_flight_plan_tab(self):
         widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(20)
 
-        # 使用分割器，方便用户调节左右比例
-        splitter = QSplitter(Qt.Horizontal)
-
-        # ================= 左半部分：表单制作区 =================
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(15)
-
-        # 飞机预览（放在表单顶部）
-        self.plane_img_label = QLabel()
-        self.plane_img_label.setFixedSize(500, 200) 
-        self.plane_img_label.setAlignment(Qt.AlignCenter)
-        self.plane_img_label.setText("等待输入注册号预览照片...")
-        self.plane_img_label.setStyleSheet("""
-            QLabel {
-                background: rgba(0,0,0,150); 
-                border-radius: 15px;
-                border: 1px solid rgba(255,255,255,0.1);
-                color: #555;
-            }
-        """)
-        left_layout.addWidget(self.plane_img_label, alignment=Qt.AlignCenter)
-
-        # 表单卡片
-        form_card = QFrame()
-        form_card.setStyleSheet("background: rgba(0,0,0,120); border-radius: 15px; padding: 10px;")
-        form_layout = QVBoxLayout(form_card)
+        # 标题栏
+        header = QHBoxLayout()
+        title = QLabel("📝 提交飞行计划 (File Flight Plan)")
+        title.setStyleSheet("color: white; font-size: 24px; font-weight: bold;")
         
-        self.fields = {}
-        field_configs = [
-            ("航班号 (CALLSIGN)", "例如: CCA1234", "callsign"),
-            ("注册号 (REGISTRATION)", "例如: B-32DN", "reg"),
-            ("机型 (AIRCRAFT)", "自动识别或手动输入", "ac"),
-            ("起飞机场 (DEPARTURE)", "ICAO (如 ZBAA)", "dep"),
-            ("落地机场 (ARRIVAL)", "ICAO (如 ZSSS)", "arr"),
-            ("航路 (ROUTE)", "输入 DCT 代表直飞", "route")
-        ]
-
-        for label, placeholder, key in field_configs:
-            row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setFixedWidth(150)
-            lbl.setStyleSheet("color: #3498db; font-weight: bold; font-size: 11px;")
-            
-            edit = QLineEdit()
-            edit.setPlaceholderText(placeholder)
-            if key == "route": edit.setText("DCT")
-            edit.setStyleSheet("padding: 8px; background: rgba(255,255,255,10); border-radius: 5px; color: white;")
-            
-            if key == "reg":
-                edit.editingFinished.connect(self.fetch_plane_photo)
-            if key in ["dep", "arr"]:
-                edit.editingFinished.connect(self.update_map)
-            
-            self.fields[key] = edit
-            row.addWidget(lbl)
-            row.addWidget(edit)
-            form_layout.addLayout(row)
-
-        left_layout.addWidget(form_card)
-
-        # 制作按钮
-        self.save_btn = QPushButton("本地制作飞行计划 (CREATE LOCAL PLAN)")
-        self.save_btn.setFixedHeight(50)
-        self.save_btn.setStyleSheet("""
-            QPushButton {
-                background: #27ae60;
-                color: white;
-                border-radius: 10px;
-                font-weight: bold;
-                font-size: 14px;
-            }
+        # 操作按钮
+        btn_box = QHBoxLayout()
+        self.submit_plan_btn = QPushButton("提交计划 (Submit)")
+        self.submit_plan_btn.setStyleSheet("""
+            QPushButton { background: #27ae60; color: white; padding: 10px 20px; border-radius: 5px; font-weight: bold; }
             QPushButton:hover { background: #2ecc71; }
         """)
-        self.save_btn.clicked.connect(lambda: self.show_notification("飞行计划已本地生成！"))
-        left_layout.addWidget(self.save_btn)
+        self.submit_plan_btn.clicked.connect(self.submit_server_flight_plan)
         
-        splitter.addWidget(left_container)
+        self.delete_plan_btn = QPushButton("删除计划 (Delete)")
+        self.delete_plan_btn.setStyleSheet("""
+            QPushButton { background: #c0392b; color: white; padding: 10px 20px; border-radius: 5px; font-weight: bold; }
+            QPushButton:hover { background: #e74c3c; }
+        """)
+        self.delete_plan_btn.clicked.connect(self.delete_server_flight_plan)
+        self.delete_plan_btn.hide() # 默认隐藏，有计划时显示
+        
+        refresh_plan_btn = QPushButton("刷新 (Refresh)")
+        refresh_plan_btn.setStyleSheet("""
+            QPushButton { background: #3498db; color: white; padding: 10px 20px; border-radius: 5px; font-weight: bold; }
+            QPushButton:hover { background: #2980b9; }
+        """)
+        refresh_plan_btn.clicked.connect(self.load_server_flight_plan)
 
-        # ================= 右半部分：航迹地图区 =================
-        self.map_view = QWebEngineView()
-        self.map_view.setStyleSheet("border-radius: 15px; background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1);")
-        # 初始加载一个带深色主题的空地图
-        self.load_empty_map()
+        btn_box.addWidget(self.submit_plan_btn)
+        btn_box.addWidget(self.delete_plan_btn)
+        btn_box.addWidget(refresh_plan_btn)
         
-        splitter.addWidget(self.map_view)
-        
-        # 设置左右比例
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        header.addWidget(title)
+        header.addStretch()
+        header.addLayout(btn_box)
+        layout.addLayout(header)
 
-        layout.addWidget(splitter)
+        # 滚动区域容器
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("background: transparent; border: none;")
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(15)
+        
+        # 表单容器
+        form_group = QGroupBox("飞行计划详情")
+        form_group.setStyleSheet("""
+            QGroupBox { 
+                color: #f39c12; font-weight: bold; font-size: 16px;
+                border: 2px solid #f39c12; border-radius: 8px; margin-top: 15px; 
+                background: rgba(0, 0, 0, 0.3);
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 15px; padding: 0 5px; }
+            QLineEdit, QComboBox, QTimeEdit, QSpinBox, QTextEdit {
+                padding: 8px; border-radius: 5px; border: 1px solid #555; background: #2c3e50; color: white; font-size: 14px;
+            }
+            QLabel { color: #bdc3c7; font-weight: bold; }
+        """)
+        form_layout = QGridLayout(form_group)
+        form_layout.setContentsMargins(20, 30, 20, 20)
+        form_layout.setSpacing(15)
+
+        self.plan_fields = {}
+
+        # 1. 基础信息
+        
+        self.plan_fields['callsign'] = QLineEdit()
+        self.plan_fields['callsign'].setPlaceholderText("CCA123")
+        
+        self.plan_fields['flight_rules'] = QComboBox()
+        self.plan_fields['flight_rules'].addItems(["I - IFR", "V - VFR"])
+        
+        self.plan_fields['aircraft'] = QLineEdit()
+        self.plan_fields['aircraft'].setPlaceholderText("B738")
+        
+        self.plan_fields['wake_turbulence'] = QComboBox()
+        self.plan_fields['wake_turbulence'].addItems(["L - Light", "M - Medium", "H - Heavy", "J - Super"])
+        self.plan_fields['wake_turbulence'].setCurrentIndex(1) # Default M
+        
+        # Row 0
+        form_layout.addWidget(QLabel("航班号:"), 0, 0)
+        form_layout.addWidget(self.plan_fields['callsign'], 0, 1)
+        form_layout.addWidget(QLabel("飞行规则:"), 0, 2)
+        form_layout.addWidget(self.plan_fields['flight_rules'], 0, 3)
+        form_layout.addWidget(QLabel("航空器型别:"), 0, 4)
+        form_layout.addWidget(self.plan_fields['aircraft'], 0, 5)
+        form_layout.addWidget(QLabel("尾流等级:"), 0, 6)
+        form_layout.addWidget(self.plan_fields['wake_turbulence'], 0, 7)
+        
+        # 2. 设备与代码
+        
+        self.plan_fields['equipment'] = QLineEdit()
+        self.plan_fields['equipment'].setPlaceholderText("SDE1E2E3FGHIJ1RWXY/LB1")
+        
+        self.plan_fields['transponder'] = QLineEdit()
+        self.plan_fields['transponder'].setPlaceholderText("1000")
+        self.plan_fields['transponder'].setMaxLength(4)
+        
+        # Row 1
+        form_layout.addWidget(QLabel("机载设备:"), 1, 0)
+        form_layout.addWidget(self.plan_fields['equipment'], 1, 1, 1, 3) # 跨3列
+        form_layout.addWidget(QLabel("应答机:"), 1, 4)
+        form_layout.addWidget(self.plan_fields['transponder'], 1, 5)
+        
+        # 3. 巡航信息
+        
+        self.plan_fields['dep'] = QLineEdit()
+        self.plan_fields['dep'].setPlaceholderText("ZBAA")
+        self.plan_fields['dep'].setMaxLength(4)
+        
+        self.plan_fields['dep_time'] = QTimeEdit()
+        self.plan_fields['dep_time'].setDisplayFormat("HHmm")
+        self.plan_fields['dep_time'].setButtonSymbols(QAbstractSpinBox.NoButtons)
+        
+        self.plan_fields['altitude'] = QLineEdit()
+        self.plan_fields['altitude'].setPlaceholderText("FL321")
+
+        self.plan_fields['cruise_tas'] = QSpinBox()
+        self.plan_fields['cruise_tas'].setRange(0, 9999)
+        self.plan_fields['cruise_tas'].setValue(450)
+        self.plan_fields['cruise_tas'].setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.plan_fields['cruise_tas'].setSuffix(" kt")
+
+        # Row 2
+        form_layout.addWidget(QLabel("起飞机场:"), 2, 0)
+        form_layout.addWidget(self.plan_fields['dep'], 2, 1)
+        form_layout.addWidget(QLabel("预计起飞时间:"), 2, 2)
+        form_layout.addWidget(self.plan_fields['dep_time'], 2, 3)
+        form_layout.addWidget(QLabel("巡航高度:"), 2, 4)
+        form_layout.addWidget(self.plan_fields['altitude'], 2, 5)
+        form_layout.addWidget(QLabel("巡航真空速:"), 2, 6)
+        form_layout.addWidget(self.plan_fields['cruise_tas'], 2, 7)
+        
+        # 4. 落地与备降
+        
+        self.plan_fields['arr'] = QLineEdit()
+        self.plan_fields['arr'].setPlaceholderText("ZSSS")
+        self.plan_fields['arr'].setMaxLength(4)
+        
+        self.plan_fields['alt'] = QLineEdit()
+        self.plan_fields['alt'].setPlaceholderText("ZSPD")
+
+        self.plan_fields['eet_h'] = QSpinBox()
+        self.plan_fields['eet_h'].setRange(0, 99)
+        self.plan_fields['eet_h'].setSuffix(" h")
+        self.plan_fields['eet_h'].setButtonSymbols(QAbstractSpinBox.NoButtons)
+        
+        self.plan_fields['eet_m'] = QSpinBox()
+        self.plan_fields['eet_m'].setRange(0, 59)
+        self.plan_fields['eet_m'].setSuffix(" m")
+        self.plan_fields['eet_m'].setButtonSymbols(QAbstractSpinBox.NoButtons)
+        
+        # Row 3
+        form_layout.addWidget(QLabel("落地机场:"), 3, 0)
+        form_layout.addWidget(self.plan_fields['arr'], 3, 1)
+        form_layout.addWidget(QLabel("备降机场:"), 3, 2)
+        form_layout.addWidget(self.plan_fields['alt'], 3, 3)
+        form_layout.addWidget(QLabel("预计飞行时间:"), 3, 4)
+        
+        hbox_eet = QHBoxLayout()
+        hbox_eet.addWidget(self.plan_fields['eet_h'])
+        hbox_eet.addWidget(self.plan_fields['eet_m'])
+        form_layout.addLayout(hbox_eet, 3, 5)
+        
+        # 5. 燃油与其他
+        
+        self.plan_fields['fuel_h'] = QSpinBox()
+        self.plan_fields['fuel_h'].setRange(0, 99)
+        self.plan_fields['fuel_h'].setSuffix(" h")
+        self.plan_fields['fuel_h'].setButtonSymbols(QAbstractSpinBox.NoButtons)
+        
+        self.plan_fields['fuel_m'] = QSpinBox()
+        self.plan_fields['fuel_m'].setRange(0, 59)
+        self.plan_fields['fuel_m'].setSuffix(" m")
+        self.plan_fields['fuel_m'].setButtonSymbols(QAbstractSpinBox.NoButtons)
+        
+        # Row 3 continued (Sharing row or new row? Let's use new row for fuel)
+        # Row 4
+        form_layout.addWidget(QLabel("续航时间:"), 3, 6)
+        hbox_fuel = QHBoxLayout()
+        hbox_fuel.addWidget(self.plan_fields['fuel_h'])
+        hbox_fuel.addWidget(self.plan_fields['fuel_m'])
+        form_layout.addLayout(hbox_fuel, 3, 7)
+
+        # 6. 航路
+        self.plan_fields['route'] = QTextEdit()
+        self.plan_fields['route'].setPlaceholderText("DCT")
+        self.plan_fields['route'].setMaximumHeight(100)
+        
+        # Row 5
+        form_layout.addWidget(QLabel("飞行航路:"), 4, 0)
+        form_layout.addWidget(self.plan_fields['route'], 4, 1, 1, 7)
+
+        # 7. 备注
+        self.plan_fields['remarks'] = QLineEdit()
+        self.plan_fields['remarks'].setPlaceholderText("PBN/A1B1C1D1L1O1S1 DOF/240101...")
+        
+        # Row 6
+        form_layout.addWidget(QLabel("备注 (RMK):"), 5, 0)
+        form_layout.addWidget(self.plan_fields['remarks'], 5, 1, 1, 7)
+
+
+        content_layout.addWidget(form_group)
+        content_layout.addStretch()
+        
+        scroll.setWidget(content_widget)
+        layout.addWidget(scroll)
+        
+        # 初始加载
+        QTimer.singleShot(1000, self.load_server_flight_plan)
+        
         return widget
 
+    def load_server_flight_plan(self):
+        if not self.auth_token:
+            self.show_notification("请先登录")
+            return
+
+        self.get_plan_thread = APIThread(
+            f"{ISFP_API_BASE}/plans/self",
+            headers={"Authorization": f"Bearer {self.auth_token}"}
+        )
+        self.get_plan_thread.finished.connect(self.on_plan_loaded)
+        self.manage_thread(self.get_plan_thread)
+
+    def on_plan_loaded(self, data):
+        # 成功获取：GET_FLIGHT_PLAN，无计划：可能是 404 或者 data 为 null
+        # 根据 API 文档，如果没有计划，可能返回 null 或者特定的 code，这里需做兼容
+        if data.get("code") == "GET_FLIGHT_PLAN" and data.get("data"):
+            plan = data["data"]
+            self.plan_fields['callsign'].setText(plan.get('callsign', ''))
+            
+            # 规则处理 (I, V)
+            rules = ["I", "V"]
+            rule_char = plan.get('flight_rules', 'I')
+            for i, r in enumerate(rules):
+                if rule_char == r:
+                    self.plan_fields['flight_rules'].setCurrentIndex(i)
+                    break
+            
+            self.plan_fields['aircraft'].setText(plan.get('aircraft', ''))
+            self.plan_fields['cruise_tas'].setValue(int(plan.get('cruise_tas', 450)))
+            self.plan_fields['dep'].setText(plan.get('departure', ''))
+            
+            # 尝试从备注或机型中解析 尾流、设备、应答机
+            # 假设存储格式为 remarks: "... /WAKE/M /EQPT/SDE... /XPDR/1000"
+            raw_remarks = plan.get('remarks', '')
+            
+            # 解析 WAKE
+            wake_map = {"L": 0, "M": 1, "H": 2, "J": 3}
+            import re
+            wake_match = re.search(r'/WAKE/([LMHJ])', raw_remarks)
+            if wake_match:
+                w = wake_match.group(1)
+                if w in wake_map:
+                    self.plan_fields['wake_turbulence'].setCurrentIndex(wake_map[w])
+                raw_remarks = raw_remarks.replace(wake_match.group(0), "").strip()
+            
+            # 解析 EQPT
+            eqpt_match = re.search(r'/EQPT/([^ ]+)', raw_remarks)
+            if eqpt_match:
+                self.plan_fields['equipment'].setText(eqpt_match.group(1))
+                raw_remarks = raw_remarks.replace(eqpt_match.group(0), "").strip()
+            else:
+                self.plan_fields['equipment'].clear()
+                
+            # 解析 XPDR
+            xpdr_match = re.search(r'/XPDR/(\d{4})', raw_remarks)
+            if xpdr_match:
+                self.plan_fields['transponder'].setText(xpdr_match.group(1))
+                raw_remarks = raw_remarks.replace(xpdr_match.group(0), "").strip()
+            else:
+                self.plan_fields['transponder'].clear()
+            
+            # 清理后的 remarks 回显
+            self.plan_fields['remarks'].setText(raw_remarks)
+            
+            # 时间格式 HHMM -> QTime
+            dep_time_int = plan.get('departure_time', 0)
+            h = dep_time_int // 100
+            m = dep_time_int % 100
+            from PySide6.QtCore import QTime
+            self.plan_fields['dep_time'].setTime(QTime(h, m))
+            
+            self.plan_fields['altitude'].setText(plan.get('altitude', ''))
+            self.plan_fields['arr'].setText(plan.get('arrival', ''))
+            
+            self.plan_fields['eet_h'].setValue(int(plan.get('route_time_hour', 0)))
+            self.plan_fields['eet_m'].setValue(int(plan.get('route_time_minute', 0)))
+            
+            self.plan_fields['fuel_h'].setValue(int(plan.get('fuel_time_hour', 0)))
+            self.plan_fields['fuel_m'].setValue(int(plan.get('fuel_time_minute', 0)))
+            
+            self.plan_fields['alt'].setText(plan.get('alternate', ''))
+            self.plan_fields['remarks'].setText(plan.get('remarks', ''))
+            self.plan_fields['route'].setPlainText(plan.get('route', ''))
+            
+            # 显示删除按钮，并将提交按钮改为“更新”
+            self.delete_plan_btn.show()
+            self.submit_plan_btn.setText("更新计划 (Update)")
+            self.show_notification("已加载现有飞行计划")
+        else:
+            # 没有计划或获取失败
+            self.delete_plan_btn.hide()
+            self.submit_plan_btn.setText("提交计划 (Submit)")
+            # self.show_notification("暂无飞行计划，请填写提交")
+
+    def submit_server_flight_plan(self):
+        if not self.auth_token:
+            self.show_notification("请先登录")
+            return
+            
+        # 收集数据
+        try:
+            # 确保 CID 存在
+            cid = self.user_data.get('user', {}).get('cid')
+            if not cid:
+                self.show_notification("无法获取 CID，请重新登录")
+                return
+
+            dep_time_str = self.plan_fields['dep_time'].text() # HHmm
+            dep_time_int = int(dep_time_str)
+            
+            # 构建备注 (包含 Wake, Equipment, Transponder)
+            remarks_base = self.plan_fields['remarks'].text().strip().upper()
+            wake = self.plan_fields['wake_turbulence'].currentText()[0] # L, M, H, J
+            eqpt = self.plan_fields['equipment'].text().strip().upper()
+            xpdr = self.plan_fields['transponder'].text().strip()
+            
+            # 将这些额外字段追加到 remarks 中以便持久化
+            final_remarks = f"{remarks_base} /WAKE/{wake}"
+            if eqpt:
+                final_remarks += f" /EQPT/{eqpt}"
+            if xpdr:
+                final_remarks += f" /XPDR/{xpdr}"
+            
+            payload = {
+                "cid": int(cid),
+                "callsign": self.plan_fields['callsign'].text().strip().upper(),
+                "flight_rules": self.plan_fields['flight_rules'].currentText()[0], # 取首字母
+                "aircraft": self.plan_fields['aircraft'].text().strip().upper(),
+                "cruise_tas": self.plan_fields['cruise_tas'].value(),
+                "departure": self.plan_fields['dep'].text().strip().upper(),
+                "departure_time": dep_time_int,
+                "altitude": self.plan_fields['altitude'].text().strip().upper(),
+                "arrival": self.plan_fields['arr'].text().strip().upper(),
+                "route_time_hour": str(self.plan_fields['eet_h'].value()),
+                "route_time_minute": str(self.plan_fields['eet_m'].value()),
+                "fuel_time_hour": str(self.plan_fields['fuel_h'].value()),
+                "fuel_time_minute": str(self.plan_fields['fuel_m'].value()),
+                "alternate": self.plan_fields['alt'].text().strip().upper(),
+                "remarks": final_remarks,
+                "route": self.plan_fields['route'].toPlainText().strip().upper(),
+                "locked": False
+            }
+            
+            # 简单校验
+            if not payload['callsign'] or not payload['departure'] or not payload['arrival']:
+                self.show_notification("请填写完整的呼号、起降机场")
+                return
+
+            self.submit_plan_thread = APIThread(
+                f"{ISFP_API_BASE}/plans",
+                method="POST",
+                json_data=payload,
+                headers={"Authorization": f"Bearer {self.auth_token}"}
+            )
+            self.submit_plan_thread.finished.connect(lambda d: [
+                self.show_notification(d.get('message', '操作完成')),
+                self.load_server_flight_plan() if d.get('code') == 'SUBMIT_FLIGHT_PLAN' else None
+            ])
+            self.manage_thread(self.submit_plan_thread)
+            
+        except Exception as e:
+            self.show_notification(f"数据错误: {str(e)}")
+
+    def delete_server_flight_plan(self):
+        if not self.auth_token: return
+        
+        from PySide6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(self, "确认删除", "确定要删除当前的飞行计划吗？",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self.del_plan_thread = APIThread(
+            f"{ISFP_API_BASE}/plans/self",
+            method="DELETE",
+            headers={"Authorization": f"Bearer {self.auth_token}"}
+        )
+        self.del_plan_thread.finished.connect(lambda d: [
+            self.show_notification(d.get('message', '操作完成')),
+            # 清空表单或重置状态
+            self.load_server_flight_plan() if d.get('code') == 'DELETE_SELF_FLIGHT_PLAN' else None
+        ])
+        self.manage_thread(self.del_plan_thread)
+
     def load_empty_map(self):
-        # 使用 Leaflet.js 构建一个简单的深色主题地图
-        html = """
-        <html>
-        <head>
-            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-            <style>
-                body { margin: 0; background: #1a1a1a; }
-                #map { height: 100vh; width: 100vw; }
-            </style>
-        </head>
-        <body>
-            <div id="map"></div>
-            <script>
-                var map = L.map('map', {zoomControl: false}).setView([35, 110], 4);
-                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                    attribution: '&copy; OpenStreetMap'
-                }).addTo(map);
-            </script>
-        </body>
-        </html>
-        """
-        self.map_view.setHtml(html)
+        # 保留此方法防止报错，但不再使用
+        pass
 
     def update_map(self):
-        dep = self.fields["dep"].text().strip().upper()
-        arr = self.fields["arr"].text().strip().upper()
-        if not dep and not arr: return
-        
-        # 构建 SkyVector 的航图链接作为快速预览（更专业且符合连飞需求）
-        # 或者继续使用 Leaflet 展示坐标（需要坐标 API，这里为了演示直接使用 SkyVector 嵌入）
-        url = f"https://skyvector.com/?ll=35,110&chart=301&zoom=3"
-        if dep and arr:
-            url = f"https://skyvector.com/?fpl={dep}%20DCT%20{arr}"
-        elif dep:
-            url = f"https://skyvector.com/?fpl={dep}"
-            
-        self.map_view.setUrl(QUrl(url))
+        # 保留此方法防止报错，但不再使用
+        pass
 
     def create_styled_input(self, label, placeholder, key, default="", blur_event=None):
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
-
-        lbl = QLabel(label)
-        lbl.setStyleSheet("color: #3498db; font-weight: bold; font-size: 12px; margin-left: 5px;")
-        layout.addWidget(lbl)
-
-        edit = QLineEdit()
-        edit.setPlaceholderText(placeholder)
-        edit.setText(default)
-        edit.setStyleSheet("""
-            QLineEdit {
-                padding: 12px;
-                background: rgba(255,255,255,10);
-                border: 1px solid rgba(255,255,255,10);
-                border-radius: 10px;
-                color: white;
-                font-size: 14px;
-            }
-            QLineEdit:focus {
-                border: 1px solid #3498db;
-                background: rgba(255,255,255,15);
-            }
-        """)
-        if blur_event:
-            edit.editingFinished.connect(blur_event)
-        
-        layout.addWidget(edit)
-        self.fields[key] = edit
-        return container
+        # 保留此方法防止报错，但不再使用
+        return QWidget()
 
     def show_notification(self, message):
         # 全局状态反馈
