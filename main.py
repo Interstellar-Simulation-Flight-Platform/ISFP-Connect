@@ -11,21 +11,79 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QScrollArea, QFrame, QGraphicsBlurEffect, QSplitter,
                              QDialog, QCheckBox, QFileDialog, QComboBox, QDateEdit, 
                              QTimeEdit, QSpinBox, QFormLayout, QGroupBox, QAbstractSpinBox,
-                             QGridLayout)
+                             QGridLayout, QStackedWidget)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal, QUrl, QObject, Slot, QSettings
+from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal, QUrl, QObject, Slot, QSettings, QPropertyAnimation, QEasingCurve, QPoint, QRect
 from PySide6.QtGui import QPixmap, QIcon, QFont, QPalette, QColor, QBrush, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PySide6.QtWebChannel import QWebChannel
 
+# 加载 .env 文件
+def load_env_file():
+    """从 .env 文件加载环境变量"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+load_env_file()
+
 # ================= API 配置 =================
 ISFP_API_BASE = "https://isfpapi.flyisfp.com/api"
 TAF_API_URL = "https://aviationweather.gov/api/data/taf"
-PLANE_INFO_URL = "https://airplane.yhphotos.top/api/get-registration-info.php"
+# XZPhotos API 配置
+XZPHOTOS_API_BASE = "https://api.xzphotos.cn/api/v1"
+XZPHOTOS_API_KEY = os.environ.get('XZPHOTOS_API_KEY', '')
+XZPHOTOS_API_SECRET = os.environ.get('XZPHOTOS_API_SECRET', '')
+
+# 应用版本信息
+APP_VERSION = os.environ.get('APP_VERSION', '1.0.0')
+APP_VERSION_CODE = int(os.environ.get('APP_VERSION_CODE', '1'))
+CHANGELOG = os.environ.get('CHANGELOG', '')
+
+import hashlib
+import hmac
+import uuid
+import time as time_module
+
+def generate_xzphotos_signature(params, secret_key):
+    """生成 XZPhotos API 签名"""
+    # 生成时间戳和 nonce
+    timestamp = str(int(time_module.time()))
+    nonce = str(uuid.uuid4())
+    
+    # 合并参数
+    all_params = {**params, 'timestamp': timestamp, 'nonce': nonce}
+    
+    # 按 key 排序
+    sorted_keys = sorted(all_params.keys())
+    param_string = '&'.join([f'{k}={all_params[k]}' for k in sorted_keys])
+    
+    # 追加 SecretKey
+    to_sign = param_string + secret_key
+    
+    # 生成签名
+    signature = hmac.new(
+        secret_key.encode(),
+        to_sign.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    return {
+        'timestamp': timestamp,
+        'nonce': nonce,
+        'signature': signature,
+        'param_string': param_string
+    }
 
 class APIThread(QThread):
     finished = Signal(dict)
     error = Signal(str)
+    jwt_expired = Signal()
 
     def __init__(self, url, params=None, is_json=True, headers=None, method="GET", json_data=None):
         super().__init__()
@@ -52,12 +110,85 @@ class APIThread(QThread):
             result = {}
             if self.is_json:
                 result = response.json()
+                # 检测JWT过期
+                if result.get("code") == "MISSING_OR_MALFORMED_JWT":
+                    self.jwt_expired.emit()
+                    return
             else:
                 result = {"raw_text": response.text}
             
             # 注入延迟数据
             result["_latency"] = latency
             self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class XZPhotosAPIThread(QThread):
+    """专门用于 XZPhotos API 的线程，自动处理签名"""
+    finished = Signal(dict)
+    error = Signal(str)
+    
+    def __init__(self, registration, api_key=None, api_secret=None):
+        super().__init__()
+        self.registration = registration
+        self.api_key = api_key or XZPHOTOS_API_KEY
+        self.api_secret = api_secret or XZPHOTOS_API_SECRET
+    
+    def run(self):
+        try:
+            # 准备参数
+            params = {
+                'registration': self.registration,
+                'limit': '1',
+                'page': '1'
+            }
+            
+            # 生成签名
+            sig_data = generate_xzphotos_signature(params, self.api_secret)
+            
+            # 构建 URL
+            url = f"{XZPHOTOS_API_BASE}/aircraft-images/{self.registration}?{sig_data['param_string']}"
+            
+            # 设置请求头
+            headers = {
+                'X-SECRET-ID': self.api_key,
+                'X-SIGNATURE': sig_data['signature'],
+                'X-TIMESTAMP': sig_data['timestamp'],
+                'X-NONCE': sig_data['nonce']
+            }
+            
+            # 发送请求
+            response = requests.get(url, headers=headers, timeout=10)
+            result = response.json()
+            
+            # 转换为与旧 API 兼容的格式
+            if result.get('success') and result.get('data', {}).get('images'):
+                images = result['data']['images']
+                if images:
+                    # 获取第一张图片
+                    img = images[0]
+                    compatible_result = {
+                        'success': True,
+                        'data': {
+                            'photo_found': True,
+                            'photo_image_url': img.get('watermark_url') or img.get('original_url'),
+                            'aircraft_type': img.get('aircraft_info', {}).get('aircraft_model', ''),
+                            'airline': img.get('aircraft_info', {}).get('airline', ''),
+                            'registration': self.registration
+                        }
+                    }
+                else:
+                    compatible_result = {
+                        'success': True,
+                        'data': {'photo_found': False}
+                    }
+            else:
+                compatible_result = {
+                    'success': False,
+                    'data': {'photo_found': False}
+                }
+            
+            self.finished.emit(compatible_result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -426,6 +557,11 @@ class ISFPApp(QMainWindow):
         self._active_threads = set()
         
         self.setup_ui()
+        
+        # 启动时检查登录状态
+        if not self.auth_token:
+            # 默认显示账户页面（登录页面）
+            self.switch_page(8)
 
     def resizeEvent(self, event):
         """ 处理窗口大小调整事件 """
@@ -455,7 +591,18 @@ class ISFPApp(QMainWindow):
             if thread in self._active_threads:
                 self._active_threads.remove(thread)
                 
+        def handle_jwt_expired():
+            """ 处理JWT过期 """
+            self.auth_token = None
+            self.user_data = None
+            self.update_account_ui()
+            self.show_notification("登录已过期，请重新登录")
+            # 显示登录页面
+            self.switch_page(8)
+        
         thread.finished.connect(cleanup)
+        if hasattr(thread, 'jwt_expired'):
+            thread.jwt_expired.connect(handle_jwt_expired)
         thread.start()
 
     def setup_ui(self):
@@ -478,110 +625,743 @@ class ISFPApp(QMainWindow):
         self.bg_overlay.lower() # 确保在所有交互控件下方
         self.bg_label.lower()   # 确保背景图在最底层
 
-        # 核心容器
+        # 核心容器 - 使用水平布局，左侧导航，右侧内容
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(15, 20, 15, 15)
-
-        # 顶部 Logo 栏
-        header_layout = QHBoxLayout()
-        self.logo_label = QLabel()
-        logo_pix = QPixmap("assets/logo.png")
-        if not logo_pix.isNull():
-            self.logo_label.setPixmap(logo_pix.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        header_layout.addWidget(self.logo_label)
+        self.main_layout = QHBoxLayout(self.central_widget)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
         
-        title_label = QLabel("ISFP CONNECT")
-        title_label.setFont(QFont("Microsoft YaHei", 18, QFont.Bold))
-        title_label.setStyleSheet("color: white;")
-        header_layout.addWidget(title_label)
-        
-        header_layout.addStretch()
-
-        # 新增：顶部右侧用户信息/状态区域
-        self.top_auth_layout = QHBoxLayout()
-        self.top_auth_layout.setSpacing(15)
-        
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #3498db; font-weight: bold; font-size: 13px;")
-        self.top_auth_layout.addWidget(self.status_label)
-
-        self.top_user_btn = QPushButton("未登录")
-        self.top_user_btn.setCursor(Qt.PointingHandCursor)
-        self.top_user_btn.setStyleSheet("""
+        # 全局样式 - 添加动画效果
+        self.setStyleSheet("""
             QPushButton {
-                background: rgba(255, 255, 255, 10);
-                color: #ccc;
-                border: 1px solid rgba(255, 255, 255, 20);
-                border-radius: 15px;
-                padding: 5px 15px;
-                font-size: 12px;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 15px;
+                font-weight: bold;
             }
             QPushButton:hover {
-                background: rgba(52, 152, 219, 30);
+                background-color: rgba(52, 152, 219, 0.8);
+            }
+            QPushButton:pressed {
+                background-color: rgba(41, 128, 185, 1.0);
+            }
+            QListWidget::item:hover {
+                background: rgba(52, 152, 219, 0.3);
+            }
+            QLineEdit {
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 10px;
+                background: rgba(255, 255, 255, 0.05);
                 color: white;
+            }
+            QLineEdit:focus {
+                border: 2px solid #3498db;
+                background: rgba(255, 255, 255, 0.1);
+            }
+            QTextEdit {
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 10px;
+                background: rgba(255, 255, 255, 0.05);
+                color: white;
+            }
+            QTextEdit:focus {
+                border: 2px solid #3498db;
+            }
+            QComboBox {
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px;
+                background: rgba(255, 255, 255, 0.05);
+                color: white;
+            }
+            QComboBox:hover {
                 border: 1px solid #3498db;
             }
-        """)
-        self.top_user_btn.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.count()-1))
-        self.top_auth_layout.addWidget(self.top_user_btn)
-        
-        header_layout.addLayout(self.top_auth_layout)
-        self.main_layout.addLayout(header_layout)
-
-        # 选项卡
-        self.tabs = QTabWidget()
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 0; background: transparent; }
-            QTabBar::tab { 
-                background: rgba(0, 0, 0, 100); 
-                color: #888; 
-                padding: 10px 20px; 
-                border-top-left-radius: 10px; 
-                border-top-right-radius: 10px;
-                margin-right: 2px;
+            QComboBox::drop-down {
+                border: none;
+                width: 30px;
             }
-            QTabBar::tab:selected { 
-                background: rgba(255, 255, 255, 30); 
-                color: white; 
-                border-bottom: 2px solid #3498db;
+            QSpinBox, QDateEdit, QTimeEdit {
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px;
+                background: rgba(255, 255, 255, 0.05);
+                color: white;
+            }
+            QSpinBox:focus, QDateEdit:focus, QTimeEdit:focus {
+                border: 2px solid #3498db;
+            }
+            QGroupBox {
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 12px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                color: #3498db;
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QCheckBox {
+                color: #ccc;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid #555;
+                background: rgba(255, 255, 255, 0.1);
+            }
+            QCheckBox::indicator:checked {
+                background: #3498db;
+                border-color: #3498db;
+            }
+            QScrollBar:vertical {
+                background: rgba(255, 255, 255, 0.05);
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.2);
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(52, 152, 219, 0.5);
             }
         """)
         
-        # 初始化网络管理器用于图片加载 (替代 requests 线程)
+        # 左侧导航栏
+        self.create_sidebar()
+        
+        # 右侧内容区域
+        self.content_area = QWidget()
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(15, 15, 15, 15)
+        self.content_layout.setSpacing(10)
+        
+        # 顶部状态栏
+        self.create_top_bar()
+        
+        # 初始化网络管理器用于图片加载
         self.nam = QNetworkAccessManager(self)
-
-        self.tabs.addTab(self.create_home_tab(), "首页")
-        self.tabs.addTab(self.create_weather_tab(), "气象")
-        self.tabs.addTab(self.create_map_tab(), "地图") # 新增连飞地图
-        self.tabs.addTab(self.create_online_tab(), "在线")
-        self.tabs.addTab(self.create_rating_tab(), "排行") # 新增排行榜
-        self.tabs.addTab(self.create_dispatch_tab(), "签派") # 新增签派
-        self.tabs.addTab(self.create_flight_plan_tab(), "计划")
-        self.tabs.addTab(self.create_activities_tab(), "活动")
-        self.tabs.addTab(self.create_ticket_tab(), "工单")
-        self.tabs.addTab(self.create_account_tab(), "账户")
         
-        self.main_layout.addWidget(self.tabs)
+        # 创建堆叠窗口用于切换页面
+        self.stacked_widget = QStackedWidget()
+        self.stacked_widget.addWidget(self.create_home_tab())      # 0
+        self.stacked_widget.addWidget(self.create_weather_tab())   # 1
+        self.stacked_widget.addWidget(self.create_map_tab())       # 2
+        self.stacked_widget.addWidget(self.create_rating_tab())    # 3
+        self.stacked_widget.addWidget(self.create_dispatch_tab())  # 4
+        self.stacked_widget.addWidget(self.create_flight_plan_tab()) # 5
+        self.stacked_widget.addWidget(self.create_activities_tab())  # 6
+        self.stacked_widget.addWidget(self.create_ticket_tab())      # 7
+        self.stacked_widget.addWidget(self.create_account_tab())     # 8
         
-        # 监听 Tab 切换，自动刷新工单
-        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.content_layout.addWidget(self.stacked_widget, stretch=1)
+        
+        self.main_layout.addWidget(self.sidebar, stretch=0)
+        self.main_layout.addWidget(self.content_area, stretch=1)
+        
+        # 默认显示首页
+        self.switch_page(0)
 
-    def on_tab_changed(self, index):
-        tab_name = self.tabs.tabText(index)
-        if tab_name == "工单":
-            self.load_tickets()
-        elif tab_name == "活动":
-            self.load_activities()
-        elif tab_name == "地图":
+    def create_sidebar(self):
+        """创建左侧导航栏"""
+        self.sidebar = QWidget()
+        self.sidebar.setFixedWidth(200)
+        self.sidebar.setStyleSheet("""
+            QWidget {
+                background: rgba(0, 0, 0, 0.4);
+                border-right: 1px solid rgba(255, 255, 255, 0.1);
+            }
+        """)
+        
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(10, 25, 10, 15)
+        sidebar_layout.setSpacing(5)
+        
+        # Logo
+        self.logo_container = QWidget()
+        self.logo_container.setAttribute(Qt.WA_TranslucentBackground)
+        self.logo_container.setFixedHeight(45)
+        self.logo_layout = QHBoxLayout(self.logo_container)
+        self.logo_layout.setContentsMargins(0, 0, 0, 0)
+        self.logo_layout.setSpacing(0)
+        
+        # 左侧占位
+        left_spacer = QWidget()
+        left_spacer.setFixedWidth(0)
+        self.logo_layout.addWidget(left_spacer)
+        self.logo_layout.addStretch()
+        
+        self.logo_label = QLabel()
+        self.logo_label.setAttribute(Qt.WA_TranslucentBackground)
+        self.logo_label.setFixedSize(35, 35)
+        logo_pix = QPixmap("assets/logo.png")
+        if not logo_pix.isNull():
+            self.logo_label.setPixmap(logo_pix.scaled(35, 35, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.logo_layout.addWidget(self.logo_label)
+        
+        self.title_label = QLabel("ISFP")
+        self.title_label.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
+        self.title_label.setAttribute(Qt.WA_TranslucentBackground)
+        self.title_label.setStyleSheet("color: #3498db; background: transparent;")
+        self.logo_layout.addWidget(self.title_label)
+        
+        self.logo_layout.addStretch()
+        
+        # 右侧占位（比左侧小一点，使整体靠左）
+        self.right_spacer = QWidget()
+        self.right_spacer.setFixedWidth(10)
+        self.right_spacer.setAttribute(Qt.WA_TranslucentBackground)
+        self.right_spacer.setStyleSheet("background: transparent;")
+        self.logo_layout.addWidget(self.right_spacer)
+        
+        sidebar_layout.addWidget(self.logo_container)
+        sidebar_layout.addSpacing(30)
+        
+        # 导航按钮
+        nav_items = [
+            ("🏠", "首页", 0),
+            ("🌤", "气象", 1),
+            ("🗺", "地图", 2),
+            ("🏆", "排行", 3),
+            ("✈", "签派", 4),
+            ("📋", "计划", 5),
+            ("📅", "活动", 6),
+            ("🎫", "工单", 7),
+            ("👤", "账户", 8),
+        ]
+        
+        self.nav_buttons = []
+        self.nav_texts = []  # 保存按钮文本
+        for icon, text, index in nav_items:
+            btn = QPushButton(f"{icon}  {text}")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(45)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    color: #bdc3c7;
+                    text-align: left;
+                    padding-left: 15px;
+                    font-size: 13px;
+                    border-radius: 8px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background: rgba(52, 152, 219, 0.2);
+                    color: white;
+                }
+                QPushButton:checked {
+                    background: rgba(52, 152, 219, 0.4);
+                    color: white;
+                    border-left: 3px solid #3498db;
+                }
+            """)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked, idx=index: self.switch_page(idx))
+            btn.pressed.connect(lambda b=btn: self.animate_button_click(b))
+            self.nav_buttons.append(btn)
+            self.nav_texts.append(text)
+            sidebar_layout.addWidget(btn)
+        
+        sidebar_layout.addStretch()
+        
+        # 版本号显示（可点击查看更新日志）
+        self.version_container = QWidget()
+        self.version_container.setAttribute(Qt.WA_TranslucentBackground)
+        self.version_layout = QHBoxLayout(self.version_container)
+        self.version_layout.setContentsMargins(0, 5, 0, 5)
+        self.version_layout.setAlignment(Qt.AlignCenter)
+        
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setFont(QFont("Microsoft YaHei", 10))
+        self.version_label.setStyleSheet("color: #7f8c8d; background: transparent;")
+        self.version_label.setAlignment(Qt.AlignCenter)
+        self.version_label.setCursor(Qt.PointingHandCursor)
+        self.version_label.mousePressEvent = lambda e: self.show_changelog_dialog()
+        self.version_label.setToolTip("点击查看更新日志")
+        
+        self.version_layout.addWidget(self.version_label)
+        sidebar_layout.addWidget(self.version_container)
+        
+        # 底部状态
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #3498db; font-size: 11px; background: transparent;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        sidebar_layout.addWidget(self.status_label)
+        
+        sidebar_layout.addSpacing(10)
+        
+        # 收缩/展开按钮（放在底部）
+        self.toggle_sidebar_btn = QPushButton("◀")
+        self.toggle_sidebar_btn.setFixedSize(32, 32)
+        self.toggle_sidebar_btn.setCursor(Qt.PointingHandCursor)
+        self.toggle_sidebar_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #7f8c8d;
+                border: 2px solid #7f8c8d;
+                border-radius: 16px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                color: #3498db;
+                border: 2px solid #3498db;
+                background: rgba(52, 152, 219, 0.1);
+            }
+        """)
+        self.toggle_sidebar_btn.clicked.connect(self.toggle_sidebar)
+        
+        toggle_container = QWidget()
+        toggle_container.setAttribute(Qt.WA_TranslucentBackground)
+        toggle_layout = QHBoxLayout(toggle_container)
+        toggle_layout.setContentsMargins(0, 0, 0, 0)
+        toggle_layout.setAlignment(Qt.AlignCenter)
+        toggle_layout.addWidget(self.toggle_sidebar_btn)
+        sidebar_layout.addWidget(toggle_container)
+        
+        # 初始化侧边栏状态
+        self.sidebar_expanded = True
+        self.sidebar_normal_width = 200
+        self.sidebar_compact_width = 70
+
+    def create_top_bar(self):
+        """创建顶部状态栏"""
+        top_bar = QWidget()
+        top_bar.setFixedHeight(50)
+        top_bar.setStyleSheet("background: transparent;")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 页面标题
+        self.page_title = QLabel("首页")
+        self.page_title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
+        self.page_title.setStyleSheet("color: white;")
+        top_layout.addWidget(self.page_title)
+        
+        top_layout.addStretch()
+        
+        # 用户信息按钮
+        self.top_user_btn = QPushButton("未登录")
+        self.top_user_btn.setCursor(Qt.PointingHandCursor)
+        self.top_user_btn.setFixedSize(120, 35)
+        self.top_user_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(52, 152, 219, 0.3);
+                color: white;
+                border-radius: 17px;
+                font-size: 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background: rgba(52, 152, 219, 0.5);
+            }
+        """)
+        self.top_user_btn.clicked.connect(lambda: self.switch_page(8))
+        top_layout.addWidget(self.top_user_btn)
+        
+        self.content_layout.addWidget(top_bar)
+
+    def switch_page(self, index):
+        """切换页面"""
+        # 更新按钮状态
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setChecked(i == index)
+        
+        # 切换页面
+        self.stacked_widget.setCurrentIndex(index)
+        
+        # 更新标题
+        titles = ["首页", "气象", "地图", "排行", "签派", "计划", "活动", "工单", "账户"]
+        self.page_title.setText(titles[index])
+        
+        # 自动刷新数据
+        if index == 2:  # 地图
             self.load_map_data()
-        elif tab_name == "排行":
+        elif index == 3:  # 排行
             self.load_ratings()
-        elif tab_name == "签派":
+        elif index == 4:  # 签派
             self.load_dispatch_data()
-        elif tab_name == "计划":
+        elif index == 5:  # 计划
             self.load_server_flight_plan()
+        elif index == 6:  # 活动
+            self.load_activities()
+        elif index == 7:  # 工单
+            self.load_tickets()
+        
+        # 添加切换动画效果
+        self.animate_page_switch()
+
+    def animate_page_switch(self):
+        """页面切换动画 - 淡入+滑动效果"""
+        current_widget = self.stacked_widget.currentWidget()
+        if current_widget:
+            # 淡入动画
+            opacity_anim = QPropertyAnimation(current_widget, b"windowOpacity")
+            opacity_anim.setDuration(250)
+            opacity_anim.setStartValue(0.0)
+            opacity_anim.setEndValue(1.0)
+            opacity_anim.setEasingCurve(QEasingCurve.InOutQuad)
+            
+            # 滑动动画
+            pos_anim = QPropertyAnimation(current_widget, b"pos")
+            pos_anim.setDuration(250)
+            pos_anim.setStartValue(QPoint(20, 0))
+            pos_anim.setEndValue(QPoint(0, 0))
+            pos_anim.setEasingCurve(QEasingCurve.OutCubic)
+            
+            opacity_anim.start()
+            pos_anim.start()
+            
+            # 保存动画引用防止被垃圾回收
+            self._current_animation = (opacity_anim, pos_anim)
+    
+    def animate_button_click(self, button):
+        """按钮点击动画 - 缩放效果"""
+        anim = QPropertyAnimation(button, b"geometry")
+        anim.setDuration(100)
+        original_geo = button.geometry()
+        
+        # 缩小
+        shrink_geo = QRect(
+            original_geo.x() + 2,
+            original_geo.y() + 2,
+            original_geo.width() - 4,
+            original_geo.height() - 4
+        )
+        
+        anim.setStartValue(shrink_geo)
+        anim.setEndValue(original_geo)
+        anim.setEasingCurve(QEasingCurve.OutBounce)
+        anim.start()
+        
+        # 保存引用
+        self._button_animation = anim
+    
+    def animate_widget_show(self, widget, duration=300):
+        """控件显示动画"""
+        widget.setWindowOpacity(0.0)
+        anim = QPropertyAnimation(widget, b"windowOpacity")
+        anim.setDuration(duration)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutQuad)
+        anim.start()
+        self._show_animation = anim
+    
+    def animate_list_item_enter(self, item_widget):
+        """列表项进入动画"""
+        anim = QPropertyAnimation(item_widget, b"pos")
+        anim.setDuration(200)
+        anim.setStartValue(QPoint(-20, item_widget.y()))
+        anim.setEndValue(QPoint(0, item_widget.y()))
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start()
+        self._list_animation = anim
+
+    def toggle_sidebar(self):
+        """切换侧边栏收缩/展开状态"""
+        if self.sidebar_expanded:
+            self.collapse_sidebar()
+        else:
+            self.expand_sidebar()
+
+    def collapse_sidebar(self):
+        """收缩侧边栏"""
+        self.sidebar_expanded = False
+        self.toggle_sidebar_btn.setText("▶")
+        
+        # 动画改变侧边栏宽度
+        self._sidebar_anim = QPropertyAnimation(self.sidebar, b"minimumWidth")
+        self._sidebar_anim.setDuration(250)
+        self._sidebar_anim.setStartValue(self.sidebar_normal_width)
+        self._sidebar_anim.setEndValue(self.sidebar_compact_width)
+        self._sidebar_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        
+        # 同时动画最大宽度
+        self._sidebar_max_anim = QPropertyAnimation(self.sidebar, b"maximumWidth")
+        self._sidebar_max_anim.setDuration(250)
+        self._sidebar_max_anim.setStartValue(self.sidebar_normal_width)
+        self._sidebar_max_anim.setEndValue(self.sidebar_compact_width)
+        self._sidebar_max_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        
+        # 隐藏文本
+        self.title_label.hide()
+        self.version_label.hide()
+        self.status_label.hide()
+        
+        # 调整占位宽度使 Logo 居中
+        self.right_spacer.setFixedWidth(0)
+        
+        # 按钮只显示图标
+        nav_items = ["🏠", "🌤", "🗺", "🏆", "✈", "📋", "📅", "🎫", "👤"]
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setText(nav_items[i])
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    color: #bdc3c7;
+                    text-align: center;
+                    font-size: 18px;
+                    border-radius: 8px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background: rgba(52, 152, 219, 0.2);
+                    color: white;
+                }
+                QPushButton:checked {
+                    background: rgba(52, 152, 219, 0.4);
+                    color: white;
+                    border-left: 3px solid #3498db;
+                }
+            """)
+        
+        self._sidebar_anim.start()
+        self._sidebar_max_anim.start()
+
+    def expand_sidebar(self):
+        """展开侧边栏"""
+        self.sidebar_expanded = True
+        self.toggle_sidebar_btn.setText("◀")
+        
+        # 动画改变侧边栏宽度
+        self._sidebar_anim = QPropertyAnimation(self.sidebar, b"minimumWidth")
+        self._sidebar_anim.setDuration(250)
+        self._sidebar_anim.setStartValue(self.sidebar_compact_width)
+        self._sidebar_anim.setEndValue(self.sidebar_normal_width)
+        self._sidebar_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        
+        # 同时动画最大宽度
+        self._sidebar_max_anim = QPropertyAnimation(self.sidebar, b"maximumWidth")
+        self._sidebar_max_anim.setDuration(250)
+        self._sidebar_max_anim.setStartValue(self.sidebar_compact_width)
+        self._sidebar_max_anim.setEndValue(self.sidebar_normal_width)
+        self._sidebar_max_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        
+        # 显示文本
+        self.title_label.show()
+        self.version_label.show()
+        self.status_label.show()
+        
+        # 调整占位宽度使 Logo 和标题居中偏左
+        self.right_spacer.setFixedWidth(10)
+        
+        # 恢复按钮文本
+        nav_items = [
+            ("🏠", "首页"),
+            ("🌤", "气象"),
+            ("🗺", "地图"),
+            ("🏆", "排行"),
+            ("✈", "签派"),
+            ("📋", "计划"),
+            ("📅", "活动"),
+            ("🎫", "工单"),
+            ("👤", "账户"),
+        ]
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setText(f"{nav_items[i][0]}  {nav_items[i][1]}")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    color: #bdc3c7;
+                    text-align: left;
+                    padding-left: 15px;
+                    font-size: 13px;
+                    border-radius: 8px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background: rgba(52, 152, 219, 0.2);
+                    color: white;
+                }
+                QPushButton:checked {
+                    background: rgba(52, 152, 219, 0.4);
+                    color: white;
+                    border-left: 3px solid #3498db;
+                }
+            """)
+        
+        self._sidebar_anim.start()
+        self._sidebar_max_anim.start()
+
+    def show_changelog_dialog(self):
+        """显示更新日志弹窗"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("更新日志")
+        dialog.setFixedSize(520, 450)
+        dialog.setStyleSheet("""
+            QDialog {
+                background: #1a1a2e;
+                border: 2px solid #3498db;
+                border-radius: 12px;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(25, 25, 25, 25)
+        layout.setSpacing(15)
+        
+        # 标题区域
+        header = QWidget()
+        header.setStyleSheet("background: transparent;")
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(5)
+        
+        title = QLabel("🚀 更新日志")
+        title.setFont(QFont("Microsoft YaHei", 22, QFont.Bold))
+        title.setStyleSheet("color: #3498db;")
+        title.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(title)
+        
+        version = QLabel(f"当前版本: v{APP_VERSION}")
+        version.setFont(QFont("Microsoft YaHei", 12))
+        version.setStyleSheet("color: #7f8c8d;")
+        version.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(version)
+        
+        layout.addWidget(header)
+        
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 transparent, stop:0.5 #3498db, stop:1 transparent);")
+        line.setFixedHeight(2)
+        layout.addWidget(line)
+        
+        # 更新日志内容 - 使用 QTextEdit 显示富文本
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setStyleSheet("""
+            QTextEdit {
+                background: transparent;
+                border: none;
+                padding: 10px;
+                color: white;
+            }
+            QScrollBar:vertical {
+                background: rgba(255, 255, 255, 0.05);
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(52, 152, 219, 0.5);
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(52, 152, 219, 0.8);
+            }
+        """)
+        
+        # 构建 HTML 内容
+        html_content = self.build_changelog_html()
+        text_edit.setHtml(html_content)
+        layout.addWidget(text_edit)
+        
+        # 关闭按钮
+        close_btn = QPushButton("✓ 知道了")
+        close_btn.setFixedSize(120, 40)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3498db, stop:1 #2980b9);
+                color: white;
+                border: none;
+                border-radius: 20px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4aa3df, stop:1 #3498db);
+            }
+        """)
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignCenter)
+        
+        # 显示弹窗
+        dialog.exec()
+
+    def build_changelog_html(self):
+        """构建更新日志 HTML 内容"""
+        html = """
+        <style>
+            body {
+                font-family: 'Microsoft YaHei', sans-serif;
+                color: #ecf0f1;
+                line-height: 1.6;
+                background: transparent;
+            }
+            .version-block {
+                margin-bottom: 15px;
+                padding: 10px 0;
+                background: transparent;
+                border-left: 3px solid #3498db;
+                padding-left: 15px;
+            }
+            .version-title {
+                color: #3498db;
+                font-size: 15px;
+                font-weight: bold;
+                margin-bottom: 8px;
+                background: transparent;
+            }
+            .change-item {
+                color: #bdc3c7;
+                font-size: 13px;
+                margin: 3px 0;
+                padding-left: 5px;
+                background: transparent;
+            }
+            .change-item::before {
+                content: "• ";
+                color: #2ecc71;
+            }
+            .no-data {
+                color: #7f8c8d;
+                text-align: center;
+                padding: 30px;
+                font-size: 14px;
+                background: transparent;
+            }
+        </style>
+        <body>
+        """
+        
+        if CHANGELOG and CHANGELOG.strip():
+            # 解析 CHANGELOG 格式: 版本|内容1;内容2|版本2|内容1;内容2
+            parts = CHANGELOG.split('|')
+            i = 0
+            while i < len(parts):
+                if i + 1 < len(parts):
+                    version = parts[i].strip()
+                    changes_text = parts[i + 1].strip()
+                    
+                    if version and changes_text:
+                        html += f'<div class="version-block">\n'
+                        html += f'<div class="version-title">📌 {version}</div>\n'
+                        
+                        # 解析更新内容
+                        changes = changes_text.split(';')
+                        for change in changes:
+                            change = change.strip()
+                            if change:
+                                html += f'<div class="change-item">{change}</div>\n'
+                        
+                        html += '</div>\n'
+                i += 2
+        else:
+            html += '<div class="no-data">暂无更新日志</div>'
+        
+        html += "</body>"
+        return html
 
     def create_dispatch_tab(self):
         widget = QWidget()
@@ -888,7 +1668,7 @@ class ISFPApp(QMainWindow):
                             except Exception as e:
                                 print(f"下载图片失败: {e}")
 
-                 self.auto_photo_thread = APIThread(PLANE_INFO_URL, {"registration": reg})
+                 self.auto_photo_thread = XZPhotosAPIThread(reg)
                  self.auto_photo_thread.finished.connect(on_photo_ready)
                  self.manage_thread(self.auto_photo_thread)
             
@@ -943,7 +1723,7 @@ class ISFPApp(QMainWindow):
                             except Exception as e:
                                 print(f"下载图片失败: {e}")
 
-                self.auto_photo_thread = APIThread(PLANE_INFO_URL, {"registration": reg})
+                self.auto_photo_thread = XZPhotosAPIThread(reg)
                 self.auto_photo_thread.finished.connect(on_photo_ready)
                 self.manage_thread(self.auto_photo_thread)
             else:
@@ -969,8 +1749,63 @@ class ISFPApp(QMainWindow):
 
     def create_map_tab(self):
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # 左侧：在线机组列表
+        self.online_panel = QWidget()
+        self.online_panel.setFixedWidth(300)
+        self.online_panel.setStyleSheet("background: rgba(0, 0, 0, 0.3); border-right: 1px solid rgba(255, 255, 255, 0.1);")
+        online_layout = QVBoxLayout(self.online_panel)
+        online_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 在线机组标题
+        online_title = QLabel("在线机组")
+        online_title.setStyleSheet("color: #3498db; font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        online_layout.addWidget(online_title)
+        
+        # 刷新按钮
+        refresh_btn = QPushButton("刷新机组动态")
+        refresh_btn.setStyleSheet("padding: 8px; background: #27ae60; color: white; border-radius: 6px; font-size: 12px;")
+        refresh_btn.clicked.connect(self.load_map_data)
+        online_layout.addWidget(refresh_btn)
+        
+        # 在线机组列表
+        self.online_list = QListWidget()
+        self.online_list.setStyleSheet("""
+            QListWidget {
+                background: rgba(0,0,0,0.5); 
+                border-radius: 8px; 
+                color: white; 
+                padding: 5px;
+                border: 1px solid rgba(255,255,255,0.1);
+                outline: none;
+            }
+            QListWidget::item {
+                background: rgba(255,255,255,0.08);
+                margin-bottom: 4px;
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 12px;
+                border: 1px solid transparent;
+                min-height: 60px;
+            }
+            QListWidget::item:hover {
+                background: rgba(52, 152, 219, 0.2);
+                border: 1px solid rgba(52, 152, 219, 0.5);
+            }
+            QListWidget::item:selected {
+                background: rgba(52, 152, 219, 0.4);
+                border: 1px solid #3498db;
+            }
+        """)
+        online_layout.addWidget(self.online_list)
+        
+        # 右侧：地图容器（包含地图和切换按钮）
+        map_container = QWidget()
+        map_layout = QVBoxLayout(map_container)
+        map_layout.setContentsMargins(0, 0, 0, 0)
         
         self.map_view = QWebEngineView()
         self.map_view.setStyleSheet("background: #1a1a1a;")
@@ -997,6 +1832,31 @@ class ISFPApp(QMainWindow):
                 body, html, #map { height: 100%; margin: 0; padding: 0; background: #1a1a1a; }
                 .leaflet-popup-content-wrapper { background: rgba(0,0,0,0.8); color: white; border-radius: 8px; }
                 .leaflet-popup-tip { background: rgba(0,0,0,0.8); }
+                .map-controls {
+                    position: absolute;
+                    top: 10px;
+                    right: 10px;
+                    z-index: 1000;
+                    background: rgba(0,0,0,0.7);
+                    border-radius: 8px;
+                    padding: 5px;
+                }
+                .map-controls button {
+                    background: #3498db;
+                    color: white;
+                    border: none;
+                    padding: 8px 12px;
+                    border-radius: 5px;
+                    cursor: pointer;
+                    font-size: 12px;
+                    margin: 2px;
+                }
+                .map-controls button:hover {
+                    background: #2980b9;
+                }
+                .map-controls button.active {
+                    background: #2ecc71;
+                }
             </style>
             <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
             <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -1004,13 +1864,53 @@ class ISFPApp(QMainWindow):
         </head>
         <body>
             <div id="map"></div>
+            <div class="map-controls">
+                <button id="btn-light" onclick="switchLayer('light')" class="active">浅色</button>
+                <button id="btn-dark" onclick="switchLayer('dark')">暗色</button>
+                <button id="btn-satellite" onclick="switchLayer('satellite')">卫星</button>
+            </div>
             <script>
                 var map = L.map('map').setView([35.0, 105.0], 4);
-                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                    attribution: '&copy; OpenStreetMap &copy; CARTO',
-                    subdomains: 'abcd',
-                    maxZoom: 19
-                }).addTo(map);
+                
+                // 定义不同图源
+                var layers = {
+                    dark: L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                        attribution: '&copy; OpenStreetMap &copy; CARTO',
+                        subdomains: 'abcd',
+                        maxZoom: 19
+                    }),
+                    satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                        attribution: '&copy; Esri',
+                        maxZoom: 19
+                    }),
+                    light: L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+                        attribution: '&copy; OpenStreetMap &copy; CARTO',
+                        subdomains: 'abcd',
+                        maxZoom: 19
+                    })
+                };
+                
+                // 默认添加浅色图层
+                layers.light.addTo(map);
+                var currentLayer = 'light';
+                
+                // 切换图层函数
+                switchLayer = function(type) {
+                    if (type === currentLayer) return;
+                    
+                    // 移除当前图层
+                    map.removeLayer(layers[currentLayer]);
+                    
+                    // 添加新图层
+                    layers[type].addTo(map);
+                    currentLayer = type;
+                    
+                    // 更新按钮状态
+                    document.getElementById('btn-dark').classList.remove('active');
+                    document.getElementById('btn-satellite').classList.remove('active');
+                    document.getElementById('btn-light').classList.remove('active');
+                    document.getElementById('btn-' + type).classList.add('active');
+                };
 
                 // 将变量挂载到 window 对象，确保全局可访问
                 window.markers = {};
@@ -1170,7 +2070,56 @@ class ISFPApp(QMainWindow):
         </html>
         """
         self.map_view.setHtml(html_content)
-        layout.addWidget(self.map_view)
+        map_layout.addWidget(self.map_view)
+        
+        # 创建浮动按钮容器（使用绝对定位）- 放在右上角，但在地图控制按钮下方
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        
+        toggle_container = QWidget(map_container)
+        toggle_container.setGeometry(10, map_container.height() - 50, 110, 40)
+        toggle_container.setStyleSheet("background: transparent;")
+        toggle_layout = QHBoxLayout(toggle_container)
+        toggle_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 添加在线机组列表开关按钮
+        self.toggle_btn = QPushButton("☰ 在线机组")
+        self.toggle_btn.setFixedSize(100, 35)
+        self.toggle_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(52, 152, 219, 0.95);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: rgba(52, 152, 219, 1.0);
+            }
+            QPushButton:pressed {
+                background: rgba(41, 128, 185, 1.0);
+            }
+        """)
+        
+        # 添加阴影效果
+        shadow = QGraphicsDropShadowEffect(self.toggle_btn)
+        shadow.setBlurRadius(10)
+        shadow.setColor(QColor(0, 0, 0, 100))
+        shadow.setOffset(2, 2)
+        self.toggle_btn.setGraphicsEffect(shadow)
+        
+        self.toggle_btn.clicked.connect(self.toggle_online_panel)
+        toggle_layout.addWidget(self.toggle_btn)
+        
+        # 确保按钮始终显示在左下角
+        def update_toggle_position():
+            toggle_container.setGeometry(10, map_container.height() - 50, 110, 40)
+        
+        map_container.resizeEvent = lambda event: update_toggle_position()
+        
+        # 添加到主布局
+        layout.addWidget(self.online_panel)
+        layout.addWidget(map_container, stretch=1)
         
         # 定时刷新地图
         self.map_timer = QTimer(self)
@@ -1178,22 +2127,108 @@ class ISFPApp(QMainWindow):
         self.map_timer.timeout.connect(self.load_map_data)
         self.map_timer.start()
         
+        # 初始化在线面板可见性
+        self.online_panel_visible = True
+        
         return widget
+    
+    def toggle_online_panel(self):
+        """切换在线机组列表的显示/隐藏"""
+        self.online_panel_visible = not self.online_panel_visible
+        self.online_panel.setVisible(self.online_panel_visible)
+
+    def on_pilot_item_clicked(self, item):
+        """点击在线机组列表项时在地图上定位"""
+        data = item.data(Qt.UserRole)
+        if data:
+            callsign = data.get('callsign')
+            lat = data.get('latitude')
+            lng = data.get('longitude')
+            
+            # 在地图上定位并显示 popup
+            js_code = f"""
+                if (window.markers) {{
+                    for (var id in window.markers) {{
+                        var marker = window.markers[id];
+                        var popup = marker.getPopup();
+                        if (popup && popup.getContent().includes('{callsign}')) {{
+                            map.setView(marker.getLatLng(), 10);
+                            marker.openPopup();
+                            break;
+                        }}
+                    }}
+                }}
+            """
+            self.map_view.page().runJavaScript(js_code)
 
     def load_map_data(self):
         # 使用 /clients 接口获取所有在线客户端
         self.map_data_thread = APIThread(f"{ISFP_API_BASE}/clients")
-        self.map_data_thread.finished.connect(self.on_map_data_ready)
+        # 使用 QueuedConnection 确保槽函数在主线程中执行
+        self.map_data_thread.finished.connect(self.on_map_data_ready, Qt.QueuedConnection)
         self.manage_thread(self.map_data_thread)
 
     def on_map_data_ready(self, data):
+        # 获取 pilots 数据
+        pilots = data.get("pilots", [])
+        
+        # 兼容处理：如果数据在 data.data.pilots
+        if not pilots and "data" in data and isinstance(data["data"], dict):
+            pilots = data["data"].get("pilots", [])
+        
+        # 检查 online_list 是否存在
+        if not hasattr(self, 'online_list') or self.online_list is None:
+            return
+        
+        # 检查 online_list 是否已经被销毁
+        try:
+            # 更新左侧在线机组列表
+            self.online_list.clear()
+            if not pilots:
+                item = QListWidgetItem("✈️ 暂无机组在线")
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setForeground(QColor("#bdc3c7"))
+                item.setSizeHint(QSize(0, 40))
+                self.online_list.addItem(item)
+            else:
+                for p in pilots:
+                    fp = p.get("flight_plan") or {}
+                    callsign = p.get("callsign", "Unknown")
+                    aircraft = fp.get("aircraft", "Unknown")
+                    altitude = p.get("altitude", 0)
+                    ground_speed = p.get("ground_speed", 0)
+                    latitude = p.get("latitude", 0)
+                    longitude = p.get("longitude", 0)
+                    
+                    # 格式化显示文本 - 显示更多信息
+                    dep = fp.get('departure', '???')
+                    arr = fp.get('arrival', '???')
+                    item_text = f"✈ {callsign}\n   {dep} → {arr}\n   📏 {altitude} ft | 🚀 {ground_speed} kts"
+                    item = QListWidgetItem(item_text)
+                    item.setData(Qt.UserRole, {
+                        'callsign': callsign,
+                        'latitude': latitude,
+                        'longitude': longitude,
+                        'departure': dep,
+                        'arrival': arr,
+                        'altitude': altitude,
+                        'ground_speed': ground_speed,
+                        'aircraft': aircraft
+                    })
+                    item.setSizeHint(QSize(0, 75))
+                    item.setToolTip(f"机型: {aircraft}\n起飞机场: {dep}\n降落机场: {arr}\n高度: {altitude} ft\n速度: {ground_speed} kts")
+                    self.online_list.addItem(item)
+                
+                # 连接点击事件
+                self.online_list.itemClicked.connect(self.on_pilot_item_clicked)
+        except RuntimeError:
+            # 忽略 GUI 对象已销毁的错误
+            pass
+        
         # 如果 JS 还没加载完，直接跳过
         if not getattr(self, '_map_js_ready', False):
             return
 
-        # 获取 pilots 数据
-        pilots = data.get("pilots", [])
-        
         # 转换数据为 JS 友好的格式
         js_data = []
         for p in pilots:
@@ -1675,11 +2710,34 @@ class ISFPApp(QMainWindow):
         # 更新顶部栏状态
         if self.auth_token and self.user_data:
             user = self.user_data.get("user", {})
-            self.top_user_btn.setText(f"已登录: {user.get('username')}")
-            self.top_user_btn.setStyleSheet(self.top_user_btn.styleSheet().replace("#ccc", "#2ecc71").replace("rgba(255, 255, 255, 20)", "#2ecc71"))
+            username = user.get('username', '用户')
+            self.top_user_btn.setText(f"👤 {username}")
+            self.top_user_btn.setStyleSheet("""
+                QPushButton {
+                    background: rgba(46, 204, 113, 0.3);
+                    color: white;
+                    border-radius: 17px;
+                    font-size: 12px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background: rgba(46, 204, 113, 0.5);
+                }
+            """)
         else:
             self.top_user_btn.setText("未登录")
-            self.top_user_btn.setStyleSheet(self.top_user_btn.styleSheet().replace("#2ecc71", "#ccc"))
+            self.top_user_btn.setStyleSheet("""
+                QPushButton {
+                    background: rgba(52, 152, 219, 0.3);
+                    color: white;
+                    border-radius: 17px;
+                    font-size: 12px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background: rgba(52, 152, 219, 0.5);
+                }
+            """)
 
         # 清空当前布局
         while self.account_layout.count():
@@ -1943,9 +3001,12 @@ class ISFPApp(QMainWindow):
         
         # 头像区
         avatar_container = QWidget()
+        avatar_container.setAttribute(Qt.WA_TranslucentBackground)
         avatar_layout = QVBoxLayout(avatar_container)
+        avatar_layout.setContentsMargins(0, 0, 0, 0)
         avatar = QLabel()
         avatar.setFixedSize(120, 120)
+        avatar.setAttribute(Qt.WA_TranslucentBackground)
         # 移除 border，防止蓝边干扰，同时保持背景色以防图片加载失败时太突兀
         avatar.setStyleSheet("background: transparent; border-radius: 60px;")
         avatar.setAlignment(Qt.AlignCenter)
@@ -2004,8 +3065,7 @@ class ISFPApp(QMainWindow):
         history_btn.clicked.connect(self.show_history_dialog)
         layout.addWidget(history_btn)
 
-        logout_btn = QPushButton("退出登录")
-        logout_btn.setFixedHeight(45)
+        logout_btn = QPushButton("🚪 退出登录")
         logout_btn.setCursor(Qt.PointingHandCursor)
         logout_btn.setStyleSheet("""
             QPushButton {
@@ -2014,6 +3074,7 @@ class ISFPApp(QMainWindow):
                 border: 1px solid #e74c3c;
                 border-radius: 10px;
                 font-weight: bold;
+                padding: 10px;
                 margin-top: 20px;
             }
             QPushButton:hover {
@@ -3161,6 +4222,8 @@ class ISFPApp(QMainWindow):
         self.manage_thread(self.taf_thread)
 
     def update_weather_ui(self, metar, taf, icao):
+        # 清理 TAF 报文末尾的换行符，防止多显示一行背景
+        taf_cleaned = taf.strip().replace(chr(10), "<br>")
         html = f"""
         <div style='font-family: "Segoe UI", Tahoma, sans-serif;'>
             <h2 style='color: #3498db; margin-bottom: 5px;'>{icao} 气象信息</h2>
@@ -3176,7 +4239,7 @@ class ISFPApp(QMainWindow):
             <div style='margin-top: 25px;'>
                 <b style='color: #e67e22; font-size: 16px;'>TAF</b>
                 <div style='background: rgba(230, 126, 34, 0.1); border-left: 4px solid #e67e22; padding: 10px; margin-top: 5px; font-family: "Consolas";'>
-                    {taf.replace("\n", "<br>")}
+                    {taf_cleaned}
                 </div>
             </div>
             
@@ -3247,7 +4310,7 @@ class ISFPApp(QMainWindow):
     def fetch_plane_photo(self):
         reg = self.fields["reg"].text().strip().upper()
         if not reg: return
-        self.photo_thread = APIThread(PLANE_INFO_URL, {"registration": reg})
+        self.photo_thread = XZPhotosAPIThread(reg)
         self.photo_thread.finished.connect(self.display_plane_photo)
         self.manage_thread(self.photo_thread)
 
