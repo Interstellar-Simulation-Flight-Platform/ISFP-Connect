@@ -72,3 +72,9 @@ temp/
 
 # X-Plane SDK
 XPSDK430/
+
+# 构建和缓存文件夹
+.cache/
+xplane-plugin/.vs/
+xplane-plugin/build/
+xplane-plugin/out/

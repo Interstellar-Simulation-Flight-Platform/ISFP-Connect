@@ -2417,19 +2417,15 @@ class ISFPApp(QMainWindow):
         self.hangar_list.clear()
         hangar = self.dispatch_manager.hangar
         for ac in hangar:
-            # 优先使用图片，如果没有则显示默认图标
-            if ac.get('image') and os.path.exists(ac['image']):
-                icon = QIcon(ac['image'])
-            else:
-                # 动态生成占位图
-                pix = QPixmap(220, 150)
-                pix.fill(QColor(44, 62, 80))
-                painter = QPainter(pix)
-                painter.setPen(QPen(Qt.white))
-                painter.setFont(QFont("Arial", 14, QFont.Bold))
-                painter.drawText(pix.rect(), Qt.AlignCenter, "NO IMAGE")
-                painter.end()
-                icon = QIcon(pix)
+            # 动态生成占位图作为默认图标
+            pix = QPixmap(220, 150)
+            pix.fill(QColor(44, 62, 80))
+            painter = QPainter(pix)
+            painter.setPen(QPen(Qt.white))
+            painter.setFont(QFont("Arial", 14, QFont.Bold))
+            painter.drawText(pix.rect(), Qt.AlignCenter, "NO IMAGE")
+            painter.end()
+            icon = QIcon(pix)
             
             text = f"{ac['airline']} {ac['reg']}\n{ac['type']}"
             item = QListWidgetItem(icon, text)
@@ -2438,6 +2434,17 @@ class ISFPApp(QMainWindow):
             item.setTextAlignment(Qt.AlignCenter)
             item.setData(Qt.UserRole, ac)
             self.hangar_list.addItem(item)
+            
+            # 如果有图片URL，异步加载图片
+            if ac.get('image'):
+                img_path_or_url = ac['image']
+                if img_path_or_url.startswith('http'):
+                    # 是URL，异步加载
+                    self.async_load_hangar_image(img_path_or_url, item)
+                elif os.path.exists(img_path_or_url):
+                    # 是本地路径且存在
+                    icon = QIcon(img_path_or_url)
+                    item.setIcon(icon)
             
         # 加载历史
         self.flight_history_list.clear()
@@ -2464,6 +2471,80 @@ class ISFPApp(QMainWindow):
             item.setFont(QFont("Consolas", 10))
             item.setData(Qt.UserRole, f) # 存储完整数据以便点击查看
             self.flight_history_list.addItem(item)
+
+    def async_load_hangar_image(self, url, list_item):
+        """异步加载机库图片并设置到列表项"""
+        xz_logger = logging.getLogger('ISFP-Connect.XZPhotos')
+        
+        # 获取航空器注册号作为唯一标识
+        aircraft_data = list_item.data(Qt.UserRole)
+        reg = aircraft_data.get('reg', 'unknown') if aircraft_data else 'unknown'
+        
+        # URL 解析
+        from urllib.parse import urljoin, quote, urlparse, urlunparse
+        base_api_url = "https://xzphotos.cn"
+        
+        if url.startswith("http"):
+            full_url = url
+        else:
+            full_url = urljoin(base_api_url, url)
+            
+        try:
+            parsed = urlparse(full_url)
+            new_path = quote(parsed.path, safe='/')
+            full_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                new_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+        except:
+            pass
+        
+        req = QNetworkRequest(QUrl(full_url))
+        req.setRawHeader(b"User-Agent", b"Mozilla/5.0 ISFP-Connect/1.0")
+        
+        reply = self.nam.get(req)
+        
+        def on_finished():
+            # 检查列表项是否仍然有效（通过注册号查找）
+            found_item = None
+            for i in range(self.hangar_list.count()):
+                item = self.hangar_list.item(i)
+                if item:
+                    item_data = item.data(Qt.UserRole)
+                    if item_data and item_data.get('reg') == reg:
+                        found_item = item
+                        break
+            
+            if not found_item:
+                xz_logger.debug(f"[机库图片] 列表项已不存在，跳过 - 注册号: {reg}")
+                reply.deleteLater()
+                return
+            
+            if reply.error() == QNetworkReply.NoError:
+                img_data = reply.readAll()
+                image = QImage()
+                if image.loadFromData(img_data):
+                    # 缩放到合适大小
+                    pixmap = QPixmap.fromImage(image).scaled(
+                        220, 150,
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    icon = QIcon(pixmap)
+                    found_item.setIcon(icon)
+                    xz_logger.info(f"[机库图片] 加载成功 - 注册号: {reg}")
+                else:
+                    xz_logger.warning(f"[机库图片] 图片格式错误 - 注册号: {reg}")
+            else:
+                xz_logger.warning(f"[机库图片] 加载失败 - 注册号: {reg}, 错误: {reply.errorString()}")
+            
+            reply.deleteLater()
+        
+        reply.finished.connect(on_finished)
 
     def show_history_menu(self, pos):
         item = self.flight_history_list.itemAt(pos)
@@ -2535,38 +2616,20 @@ class ISFPApp(QMainWindow):
                         img_url = res['data'].get('photo_image_url')
                         if img_url:
                             try:
-                                xz_logger.info(f"[图片下载] 开始下载 - 注册号: {reg}, URL: {img_url}")
-                                headers = {
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                                }
-                                import requests
-                                r = requests.get(img_url, headers=headers, timeout=15)
-                                xz_logger.info(f"[图片下载] 响应状态码: {r.status_code}")
-                                if r.status_code == 200:
-                                    img_dir = os.path.join(self.dispatch_manager.data_dir, "images")
-                                    if not os.path.exists(img_dir):
-                                        os.makedirs(img_dir)
-                                        xz_logger.info(f"[图片下载] 创建图片目录: {img_dir}")
-                                    img_path = os.path.join(img_dir, f"{reg}.jpg")
-                                    with open(img_path, 'wb') as f:
-                                        f.write(r.content)
-                                    xz_logger.info(f"[图片下载] 图片保存成功 - 路径: {img_path}, 大小: {len(r.content)} bytes")
-                                    
-                                    # 更新数据 (这里稍微复杂，因为我们要更新的是已经修改后的数据)
-                                    # 重新从 hangar 中找
-                                    for ac in self.dispatch_manager.hangar:
-                                        if ac['reg'] == reg: # 假设注册号没改，或者改了之后
-                                            ac['image'] = img_path
-                                            break
-                                    self.dispatch_manager.save_json(self.dispatch_manager.hangar_file, self.dispatch_manager.hangar)
-                                    self.load_dispatch_data()
-                                    xz_logger.info(f"[图片下载] 航空器数据已更新 - 注册号: {reg}")
-                                else:
-                                    xz_logger.warning(f"[图片下载] 下载失败 - 状态码: {r.status_code}")
+                                xz_logger.info(f"[图片URL] 获取成功 - 注册号: {reg}, URL: {img_url}")
+                                
+                                # 直接保存URL，不下载图片到本地
+                                for ac in self.dispatch_manager.hangar:
+                                    if ac['reg'] == reg:
+                                        ac['image'] = img_url  # 保存URL而不是本地路径
+                                        break
+                                self.dispatch_manager.save_json(self.dispatch_manager.hangar_file, self.dispatch_manager.hangar)
+                                self.load_dispatch_data()
+                                xz_logger.info(f"[图片URL] 航空器数据已更新 - 注册号: {reg}")
                             except Exception as e:
-                                xz_logger.error(f"[图片下载] 异常 - 注册号: {reg}, 错误: {str(e)}")
+                                xz_logger.error(f"[图片URL] 异常 - 注册号: {reg}, 错误: {str(e)}")
                     else:
-                        xz_logger.info(f"[图片下载] 未找到图片 - 注册号: {reg}")
+                        xz_logger.info(f"[图片URL] 未找到图片 - 注册号: {reg}")
 
                  self.auto_photo_thread = XZPhotosAPIThread(reg)
                  self.auto_photo_thread.finished.connect(on_photo_ready)
@@ -2599,41 +2662,23 @@ class ISFPApp(QMainWindow):
                     if isinstance(res, dict) and res.get('success') and res['data'].get('photo_found'):
                         img_url = res['data'].get('photo_image_url')
                         if img_url:
-                            # 下载图片并保存到本地
                             try:
-                                xz_logger.info(f"[图片下载] 开始下载 - 注册号: {reg}, URL: {img_url}")
-                                headers = {
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                                }
-                                import requests
-                                r = requests.get(img_url, headers=headers, timeout=15)
-                                xz_logger.info(f"[图片下载] 响应状态码: {r.status_code}")
-                                if r.status_code == 200:
-                                    img_dir = os.path.join(self.dispatch_manager.data_dir, "images")
-                                    if not os.path.exists(img_dir):
-                                        os.makedirs(img_dir)
-                                        xz_logger.info(f"[图片下载] 创建图片目录: {img_dir}")
-                                    img_path = os.path.join(img_dir, f"{reg}.jpg")
-                                    with open(img_path, 'wb') as f:
-                                        f.write(r.content)
-                                    xz_logger.info(f"[图片下载] 图片保存成功 - 路径: {img_path}, 大小: {len(r.content)} bytes")
-                                    
-                                    # 更新数据
-                                    for ac in self.dispatch_manager.hangar:
-                                        if ac['reg'] == reg:
-                                            ac['image'] = img_path
-                                            break
-                                    self.dispatch_manager.save_json(self.dispatch_manager.hangar_file, self.dispatch_manager.hangar)
-                                    self.load_dispatch_data() # 刷新显示
-                                    xz_logger.info(f"[图片下载] 航空器数据已更新 - 注册号: {reg}")
-                                else:
-                                    xz_logger.warning(f"[图片下载] 下载失败 - 状态码: {r.status_code}")
+                                xz_logger.info(f"[图片URL] 获取成功 - 注册号: {reg}, URL: {img_url}")
+                                
+                                # 直接保存URL，不下载图片到本地
+                                for ac in self.dispatch_manager.hangar:
+                                    if ac['reg'] == reg:
+                                        ac['image'] = img_url  # 保存URL而不是本地路径
+                                        break
+                                self.dispatch_manager.save_json(self.dispatch_manager.hangar_file, self.dispatch_manager.hangar)
+                                self.load_dispatch_data() # 刷新显示
+                                xz_logger.info(f"[图片URL] 航空器数据已更新 - 注册号: {reg}")
                             except Exception as e:
-                                xz_logger.error(f"[图片下载] 异常 - 注册号: {reg}, 错误: {str(e)}")
+                                xz_logger.error(f"[图片URL] 异常 - 注册号: {reg}, 错误: {str(e)}")
                         else:
-                            xz_logger.info(f"[图片下载] 未找到图片 - 注册号: {reg}")
+                            xz_logger.info(f"[图片URL] 未找到图片 - 注册号: {reg}")
                     else:
-                        xz_logger.info(f"[图片下载] API未返回图片 - 注册号: {reg}")
+                        xz_logger.info(f"[图片URL] API未返回图片 - 注册号: {reg}")
 
                 self.auto_photo_thread = XZPhotosAPIThread(reg)
                 self.auto_photo_thread.finished.connect(on_photo_ready)
@@ -4863,40 +4908,213 @@ class ISFPApp(QMainWindow):
 
     def show_history_dialog(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("连线历史")
-        dialog.setFixedSize(600, 600)
-        dialog.setStyleSheet("background: #2c3e50; color: white;")
-        
-        layout = QVBoxLayout(dialog)
-        
-        tabs = QTabWidget()
-        tabs.setStyleSheet("""
-            QTabWidget::pane { border: 0; }
-            QTabBar::tab { background: #34495e; color: white; padding: 10px 20px; }
-            QTabBar::tab:selected { background: #3498db; }
+        dialog.setWindowTitle("🕐 连线历史")
+        dialog.setFixedSize(700, 650)
+        dialog.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #1a1a2e, stop:1 #16213e);
+            }
+            QFrame {
+                border: none;
+            }
         """)
         
-        pilot_list = QListWidget()
-        atc_list = QListWidget()
+        main_layout = QVBoxLayout(dialog)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
         
-        # 统一样式
-        list_style = """
-            QListWidget { background: transparent; border: none; }
-            QListWidget::item { 
-                background: rgba(255,255,255,0.05); 
-                padding: 10px; 
-                margin-bottom: 5px; 
-                border-radius: 5px;
+        # 标题
+        title = QLabel("🕐 连线历史记录")
+        title.setFont(QFont("Microsoft YaHei", 20, QFont.Bold))
+        title.setStyleSheet("color: white; margin-bottom: 10px;")
+        title.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title)
+        
+        # 统计卡片区域
+        stats_widget = QWidget()
+        stats_layout = QHBoxLayout(stats_widget)
+        stats_layout.setSpacing(15)
+        
+        # 飞行时长卡片
+        self.pilot_stats_card = self._create_stat_card("✈️", "飞行时长", "0h", "#3498db")
+        # 管制时长卡片
+        self.atc_stats_card = self._create_stat_card("📡", "管制时长", "0h", "#e67e22")
+        # 总连线次数卡片
+        self.total_stats_card = self._create_stat_card("📊", "总连线次数", "0", "#2ecc71")
+        
+        stats_layout.addWidget(self.pilot_stats_card)
+        stats_layout.addWidget(self.atc_stats_card)
+        stats_layout.addWidget(self.total_stats_card)
+        main_layout.addWidget(stats_widget)
+        
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("background: rgba(255,255,255,0.1);")
+        line.setFixedHeight(1)
+        main_layout.addWidget(line)
+        
+        # Tab 控件
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane { 
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 10px;
+                background: rgba(0,0,0,0.2);
             }
-        """
-        pilot_list.setStyleSheet(list_style)
-        atc_list.setStyleSheet(list_style)
+            QTabBar::tab { 
+                background: rgba(255,255,255,0.05);
+                color: rgba(255,255,255,0.7);
+                padding: 12px 25px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                font-weight: bold;
+            }
+            QTabBar::tab:selected { 
+                background: rgba(52, 152, 219, 0.3);
+                color: white;
+                border-bottom: 2px solid #3498db;
+            }
+            QTabBar::tab:hover:!selected {
+                background: rgba(255,255,255,0.1);
+            }
+        """)
         
-        tabs.addTab(pilot_list, "飞行记录 (Pilot)")
-        tabs.addTab(atc_list, "管制记录 (ATC)")
-        layout.addWidget(tabs)
+        # 创建飞行记录列表
+        pilot_scroll = QScrollArea()
+        pilot_scroll.setWidgetResizable(True)
+        pilot_scroll.setStyleSheet("""
+            QScrollArea { 
+                border: none; 
+                background: transparent; 
+            }
+            QScrollBar:vertical {
+                background: rgba(0, 0, 0, 0.3);
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.2);
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 0.3);
+            }
+        """)
+        self.pilot_container = QWidget()
+        self.pilot_container.setStyleSheet("background: transparent;")
+        self.pilot_layout = QVBoxLayout(self.pilot_container)
+        self.pilot_layout.setSpacing(10)
+        self.pilot_layout.setContentsMargins(15, 15, 15, 15)
+        self.pilot_layout.addStretch()
+        pilot_scroll.setWidget(self.pilot_container)
+        
+        # 创建管制记录列表
+        atc_scroll = QScrollArea()
+        atc_scroll.setWidgetResizable(True)
+        atc_scroll.setStyleSheet("""
+            QScrollArea { 
+                border: none; 
+                background: transparent; 
+            }
+            QScrollBar:vertical {
+                background: rgba(0, 0, 0, 0.3);
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.2);
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 0.3);
+            }
+        """)
+        self.atc_container = QWidget()
+        self.atc_container.setStyleSheet("background: transparent;")
+        self.atc_layout = QVBoxLayout(self.atc_container)
+        self.atc_layout.setSpacing(10)
+        self.atc_layout.setContentsMargins(15, 15, 15, 15)
+        self.atc_layout.addStretch()
+        atc_scroll.setWidget(self.atc_container)
+        
+        tabs.addTab(pilot_scroll, "✈️ 飞行记录")
+        tabs.addTab(atc_scroll, "📡 管制记录")
+        main_layout.addWidget(tabs)
+        
+        # 关闭按钮
+        close_btn = QPushButton("✓ 关闭")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(52, 152, 219, 0.8);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 12px 40px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #3498db; }
+        """)
+        close_btn.clicked.connect(dialog.accept)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(close_btn)
+        btn_layout.addStretch()
+        main_layout.addLayout(btn_layout)
         
         # 加载数据
+        self._load_history_data()
+        
+        dialog.exec()
+    
+    def _create_stat_card(self, icon, title, value, color):
+        """创建统计卡片"""
+        card = QFrame()
+        card.setFixedHeight(80)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background: rgba(255,255,255,0.05);
+                border-radius: 12px;
+                border: 1px solid {color}40;
+            }}
+            QFrame:hover {{
+                background: rgba(255,255,255,0.08);
+                border: 1px solid {color}80;
+            }}
+        """)
+        
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(15, 10, 15, 10)
+        
+        # 图标
+        icon_lbl = QLabel(icon)
+        icon_lbl.setStyleSheet(f"font-size: 28px; color: {color};")
+        layout.addWidget(icon_lbl)
+        
+        # 文字信息
+        info_layout = QVBoxLayout()
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("color: rgba(255,255,255,0.6); font-size: 12px;")
+        value_lbl = QLabel(value)
+        value_lbl.setStyleSheet(f"color: {color}; font-size: 20px; font-weight: bold;")
+        # 使用属性来标识这个label，而不是objectName
+        value_lbl.setProperty("stat_type", title)
+        info_layout.addWidget(title_lbl)
+        info_layout.addWidget(value_lbl)
+        layout.addLayout(info_layout)
+        layout.addStretch()
+        
+        # 保存value_lbl的引用到card上，方便后续更新
+        card.value_label = value_lbl
+        
+        return card
+    
+    def _load_history_data(self):
+        """加载连线历史数据"""
         self.history_thread = APIThread(
             f"{ISFP_API_BASE}/users/histories/self", 
             headers={"Authorization": f"Bearer {self.auth_token}"}
@@ -4911,33 +5129,115 @@ class ISFPApp(QMainWindow):
             pilots = d.get("pilots", [])
             controllers = d.get("controllers", [])
             
-            # 更新 Tab 标题包含总时长
+            # 更新统计卡片
             pilot_hours = round(d.get("total_pilot_time", 0) / 3600, 1)
             atc_hours = round(d.get("total_atc_time", 0) / 3600, 1)
-            tabs.setTabText(0, f"飞行记录 ({pilot_hours}h)")
-            tabs.setTabText(1, f"管制记录 ({atc_hours}h)")
+            total_count = len(pilots) + len(controllers)
             
-            def add_items(items, list_widget, icon):
-                if not items:
-                    list_widget.addItem("暂无记录")
-                    return
-                    
-                for item in items:
-                    start = item.get("start_time", "").replace("T", " ").split(".")[0]
-                    duration = round(item.get("online_time", 0) / 60, 1)
-                    callsign = item.get("callsign", "Unknown")
-                    
-                    text = f"{icon} {callsign}\n   开始: {start} | 时长: {duration}分钟"
-                    lw_item = QListWidgetItem(text)
-                    list_widget.addItem(lw_item)
+            # 直接通过保存的引用更新统计值
+            if hasattr(self.pilot_stats_card, 'value_label'):
+                self.pilot_stats_card.value_label.setText(f"{pilot_hours}h")
+            if hasattr(self.atc_stats_card, 'value_label'):
+                self.atc_stats_card.value_label.setText(f"{atc_hours}h")
+            if hasattr(self.total_stats_card, 'value_label'):
+                self.total_stats_card.value_label.setText(str(total_count))
             
-            add_items(pilots, pilot_list, "✈")
-            add_items(controllers, atc_list, "📡")
+            # 添加飞行记录
+            self._add_history_items(pilots, self.pilot_layout, "✈️", "#3498db")
+            # 添加管制记录
+            self._add_history_items(controllers, self.atc_layout, "📡", "#e67e22")
             
         self.history_thread.finished.connect(on_history_loaded)
         self.manage_thread(self.history_thread)
+    
+    def _add_history_items(self, items, layout, icon, color):
+        """添加历史记录项"""
+        # 清空现有内容（保留stretch）
+        while layout.count() > 1:
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         
-        dialog.exec()
+        if not items:
+            empty_lbl = QLabel("📭 暂无记录")
+            empty_lbl.setStyleSheet("color: rgba(255,255,255,0.4); font-size: 16px; padding: 50px;")
+            empty_lbl.setAlignment(Qt.AlignCenter)
+            layout.insertWidget(0, empty_lbl)
+            return
+        
+        # 按时间倒序排列
+        sorted_items = sorted(items, key=lambda x: x.get("start_time", ""), reverse=True)
+        
+        for item_data in sorted_items:
+            card = self._create_history_card(item_data, icon, color)
+            layout.insertWidget(layout.count() - 1, card)
+    
+    def _create_history_card(self, item_data, icon, color):
+        """创建单条历史记录卡片"""
+        card = QFrame()
+        card.setFixedHeight(90)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background: rgba(255,255,255,0.03);
+                border-radius: 10px;
+                border-left: 4px solid {color};
+            }}
+            QFrame:hover {{
+                background: rgba(255,255,255,0.06);
+            }}
+        """)
+        
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(15, 10, 15, 10)
+        layout.setSpacing(15)
+        
+        # 图标区域
+        icon_widget = QWidget()
+        icon_widget.setFixedSize(50, 50)
+        icon_widget.setStyleSheet(f"""
+            background: {color}30;
+            border-radius: 25px;
+        """)
+        icon_layout = QHBoxLayout(icon_widget)
+        icon_layout.setContentsMargins(0, 0, 0, 0)
+        icon_lbl = QLabel(icon)
+        icon_lbl.setStyleSheet(f"font-size: 20px; color: {color};")
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_layout.addWidget(icon_lbl)
+        layout.addWidget(icon_widget)
+        
+        # 信息区域
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(5)
+        
+        callsign = item_data.get("callsign", "Unknown")
+        callsign_lbl = QLabel(callsign)
+        callsign_lbl.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
+        info_layout.addWidget(callsign_lbl)
+        
+        # 时间和时长
+        start_time = item_data.get("start_time", "").replace("T", " ").split(".")[0]
+        duration_sec = item_data.get("online_time", 0)
+        duration_min = round(duration_sec / 60, 1)
+        duration_hr = round(duration_sec / 3600, 2)
+        
+        if duration_hr >= 1:
+            duration_text = f"{duration_hr}小时"
+        else:
+            duration_text = f"{duration_min}分钟"
+        
+        detail_lbl = QLabel(f"🕐 {start_time}  ·  ⏱️ {duration_text}")
+        detail_lbl.setStyleSheet("color: rgba(255,255,255,0.5); font-size: 12px;")
+        info_layout.addWidget(detail_lbl)
+        
+        layout.addLayout(info_layout, stretch=1)
+        
+        # 右侧状态指示
+        status_lbl = QLabel("✓")
+        status_lbl.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: bold;")
+        layout.addWidget(status_lbl)
+        
+        return card
 
     def create_settings_tab(self):
         """创建设置页面"""
@@ -6852,55 +7152,122 @@ class ISFPApp(QMainWindow):
         
         if data.get("success") and data["data"].get("photo_found"):
             img_url = data["data"]["photo_image_url"]
-            xz_logger.info(f"[图片下载-预览] 开始下载 - 注册号: {reg}, URL: {img_url}")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
+            xz_logger.info(f"[图片URL-预览] 获取成功 - 注册号: {reg}, URL: {img_url}")
+            
+            # 使用异步加载方式从URL加载图片
+            self.async_load_image_from_url(img_url, self.plane_img_label)
+            
+            # 自动填充机型
+            if not self.fields["ac"].text():
+                aircraft_type = data["data"].get("aircraft_type", "")
+                self.fields["ac"].setText(aircraft_type)
+                xz_logger.info(f"[图片URL-预览] 自动填充机型: {aircraft_type}")
+        else:
+            xz_logger.info(f"[图片URL-预览] API未返回图片 - 注册号: {reg}")
+    
+    def async_load_image_from_url(self, url, label):
+        """从URL异步加载图片并显示"""
+        xz_logger = logging.getLogger('ISFP-Connect.XZPhotos')
+        
+        # 终极 URL 解析方案
+        from urllib.parse import urljoin, quote, urlparse, urlunparse
+        base_api_url = "https://xzphotos.cn"
+        
+        if url.startswith("http"):
+            full_url = url
+        else:
+            full_url = urljoin(base_api_url, url)
+            
+        try:
+            # 修复：使用 urlparse 正确处理 query 参数
+            parsed = urlparse(full_url)
+            new_path = quote(parsed.path, safe='/')
+            
+            full_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                new_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+        except: 
+            pass
+        
+        req = QNetworkRequest(QUrl(full_url))
+        req.setRawHeader(b"User-Agent", b"Mozilla/5.0 ISFP-Connect/1.0")
+        
+        reply = self.nam.get(req)
+        
+        def on_finished():
+            # 检查 label 是否仍然有效
             try:
-                response = requests.get(img_url, headers=headers, timeout=15)
-                xz_logger.info(f"[图片下载-预览] 响应状态码: {response.status_code}")
-                if response.status_code == 200:
-                    img_data = response.content
-                    xz_logger.info(f"[图片下载-预览] 下载成功 - 大小: {len(img_data)} bytes")
+                label_width = label.width()
+                label_height = label.height()
+            except RuntimeError:
+                reply.deleteLater()
+                return
+            
+            if reply.error() == QNetworkReply.NoError:
+                img_data = reply.readAll()
+                image = QImage()
+                if image.loadFromData(img_data):
+                    # 判断是头像(方形)还是封面(矩形)
+                    is_avatar = label_width == label_height
                     
-                    image = QImage()
-                    image.loadFromData(img_data)
-                    
-                    # 原始 Pixmap
-                    pixmap = QPixmap.fromImage(image).scaled(
-                        self.plane_img_label.size(), 
-                        Qt.KeepAspectRatio, # 改为 KeepAspectRatio 保证图片展示全
-                        Qt.SmoothTransformation
-                    )
+                    if is_avatar:
+                        # 头像处理
+                        from PySide6.QtCore import QRect
+                        size = min(image.width(), image.height())
+                        rect = QRect((image.width() - size) // 2, (image.height() - size) // 2, size, size)
+                        image = image.copy(rect)
+                        
+                        pixmap = QPixmap.fromImage(image).scaled(
+                            label.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+                        )
+                        radius = label_width / 2
+                    else:
+                        # 封面处理
+                        pixmap = QPixmap.fromImage(image).scaled(
+                            label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        )
+                        radius = 15.0
 
-                    # 创建圆角裁剪后的 Pixmap
-                    rounded_pixmap = QPixmap(pixmap.size())
+                    rounded_pixmap = QPixmap(label.size())
                     rounded_pixmap.fill(Qt.transparent)
                     
                     painter = QPainter(rounded_pixmap)
                     painter.setRenderHint(QPainter.Antialiasing)
-                    painter.setRenderHint(QPainter.SmoothPixmapTransform)
                     
                     path = QPainterPath()
-                    path.addRoundedRect(0, 0, pixmap.width(), pixmap.height(), 20, 20)
+                    path.addRoundedRect(0, 0, label.width(), label.height(), radius, radius)
                     painter.setClipPath(path)
-                    painter.drawPixmap(0, 0, pixmap)
-                    painter.end()
-
-                    self.plane_img_label.setPixmap(rounded_pixmap)
-                    self.plane_img_label.setStyleSheet("border: none;") # 移除边框，使用圆角图
-                    xz_logger.info(f"[图片下载-预览] 图片预览已显示 - 注册号: {reg}")
                     
-                    if not self.fields["ac"].text():
-                        aircraft_type = data["data"].get("aircraft_type", "")
-                        self.fields["ac"].setText(aircraft_type)
-                        xz_logger.info(f"[图片下载-预览] 自动填充机型: {aircraft_type}")
+                    # 居中绘制
+                    x = int((label.width() - pixmap.width()) / 2)
+                    y = int((label.height() - pixmap.height()) / 2)
+                    painter.drawPixmap(x, y, pixmap)
+                    
+                    if is_avatar:
+                        pen = QPen(QColor(255, 255, 255, 100))
+                        pen.setWidth(1)
+                        painter.setPen(pen)
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawEllipse(0, 0, label.width(), label.height())
+                    
+                    painter.end()
+                    
+                    label.setPixmap(rounded_pixmap)
+                    label.setStyleSheet("border: none;")
+                    xz_logger.info(f"[图片URL-预览] 图片已显示 - URL: {url[:60]}...")
                 else:
-                    xz_logger.warning(f"[图片下载-预览] 下载失败 - 状态码: {response.status_code}")
-            except Exception as e:
-                xz_logger.error(f"[图片下载-预览] 异常 - 注册号: {reg}, 错误: {str(e)}")
-        else:
-            xz_logger.info(f"[图片下载-预览] API未返回图片 - 注册号: {reg}")
+                    label.setText("图片格式错误")
+            else:
+                label.setText("加载失败")
+            
+            reply.deleteLater()
+        
+        reply.finished.connect(on_finished)
 
 if __name__ == "__main__":
     # 修复 Windows 任务栏图标不显示的问题
