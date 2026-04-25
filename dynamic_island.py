@@ -59,7 +59,7 @@ class DynamicIsland(QWidget):
         
         # 设置
         self.settings = QSettings('ISFP-Connect', 'DynamicIsland')
-        self.is_enabled = self.settings.value('dynamic_island_enabled', False, bool)
+        self.is_enabled = self.settings.value('dynamic_island_enabled', True, bool)
         
         # 默认位置：屏幕中央正上方
         screen = QApplication.primaryScreen().geometry()

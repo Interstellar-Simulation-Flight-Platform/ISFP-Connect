@@ -78,3 +78,5 @@ XPSDK430/
 xplane-plugin/.vs/
 xplane-plugin/build/
 xplane-plugin/out/
+convert_icon.py
+build_exe.py

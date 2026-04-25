@@ -172,6 +172,6 @@ static float FlightLoopCallback(float inElapsedSinceLastCall,
         g_network->SendData(data);
     }
     
-    // Return next callback interval (seconds) - 2Hz = 0.5s
-    return 0.5f;
+    // Return next callback interval (seconds) - 10Hz = 0.1s
+    return 0.1f;
 }

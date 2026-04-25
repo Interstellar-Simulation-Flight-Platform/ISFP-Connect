@@ -562,7 +562,7 @@ class FSDClient(QObject):
         # 位置更新定时器
         self._position_timer = QTimer(self)
         self._position_timer.timeout.connect(self._send_position_update)
-        self._position_interval = 5000  # 5 秒发送一次位置更新
+        self._position_interval = 200  # 0.2 秒发送一次位置更新
         
         # 当前位置
         self._current_position = FSDPilotPosition()
@@ -969,7 +969,7 @@ class FSDClient(QObject):
         )
         self._send_message(msg)
     
-    def start_position_updates(self, interval_ms: int = 5000):
+    def start_position_updates(self, interval_ms: int = 200):
         """开始定期发送位置更新"""
         self._position_interval = interval_ms
         self._position_timer.start(interval_ms)

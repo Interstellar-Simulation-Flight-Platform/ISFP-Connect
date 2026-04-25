@@ -7,6 +7,31 @@ import os
 import shutil
 import logging
 from datetime import datetime
+
+# 获取应用程序基础路径（支持开发和打包后的环境）
+def get_app_base_path():
+    """获取应用程序基础路径（用于资源文件）"""
+    if getattr(sys, 'frozen', False):
+        # 打包后的环境 - PyInstaller 解压后的临时目录
+        return sys._MEIPASS
+    else:
+        # 开发环境 - 使用脚本所在目录
+        return os.path.dirname(os.path.abspath(__file__))
+
+# 获取应用程序数据目录（用于保存配置和数据）
+def get_app_data_dir():
+    """获取应用程序数据目录（用于保存配置、日志等）"""
+    if getattr(sys, 'frozen', False):
+        # 打包后的环境 - 使用可执行文件所在目录
+        return os.path.dirname(sys.executable)
+    else:
+        # 开发环境 - 使用脚本所在目录
+        return os.path.dirname(os.path.abspath(__file__))
+
+# 获取资源文件路径
+def get_asset_path(filename):
+    """获取资源文件路径"""
+    return os.path.join(get_app_base_path(), "assets", filename)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLineEdit, QPushButton, QTextEdit, 
                              QLabel, QTabWidget, QListWidget, QListWidgetItem,
@@ -66,8 +91,9 @@ except ImportError as e:
 # ================= 日志配置 =================
 def setup_logging():
     """配置日志记录"""
-    # 确保 logs 文件夹存在
-    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    # 确保 logs 文件夹存在（支持开发和打包后的环境）
+    base_path = get_app_data_dir()
+    logs_dir = os.path.join(base_path, 'logs')
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
     log_file = os.path.join(logs_dir, 'main.log')
@@ -115,8 +141,9 @@ logger.info("=" * 60)
 
 # 加载 .env 文件
 def load_env_file():
-    """从 .env 文件加载环境变量"""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    """从 .env 文件加载环境变量（支持开发和打包后的环境）"""
+    base_path = get_app_base_path()
+    env_path = os.path.join(base_path, '.env')
     if os.path.exists(env_path):
         with open(env_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -124,24 +151,38 @@ def load_env_file():
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
                     os.environ[key] = value
+        logger.info("已加载 .env 文件")
+    else:
+        logger.warning(f".env 文件不存在: {env_path}")
 
+# ================= 编译时配置 =================
+# 这些配置直接编译进代码中，无需外部 .env 文件
+# XZPhotos API 配置
+_XZPHOTOS_API_KEY = "sk_03222883db73fd2a5200c8b1cfe464a6"
+_XZPHOTOS_API_SECRET = "e3daebcbec59e244b4d0dd3a156d712f2d2367ce85cc757ec998ba5f90d16feb"
+
+# 应用版本配置
+_APP_VERSION = "1.0.0"
+_APP_VERSION_CODE = "1"
+_CHANGELOG = "v1.0.0|初始版本发布;支持众多功能;欢迎体验~"
+
+# 尝试加载外部 .env 文件（如果存在则覆盖编译配置）
 load_env_file()
-logger.info("已加载 .env 文件")
 
 # ================= API 配置 =================
 ISFP_API_BASE = "https://isfpapi.flyisfp.com/api"
 TAF_API_URL = "https://aviationweather.gov/api/data/taf"
 # XZPhotos API 配置
 XZPHOTOS_API_BASE = "https://api.xzphotos.cn/api/v1"
-XZPHOTOS_API_KEY = os.environ.get('XZPHOTOS_API_KEY', '')
-XZPHOTOS_API_SECRET = os.environ.get('XZPHOTOS_API_SECRET', '')
+XZPHOTOS_API_KEY = os.environ.get('XZPHOTOS_API_KEY', _XZPHOTOS_API_KEY)
+XZPHOTOS_API_SECRET = os.environ.get('XZPHOTOS_API_SECRET', _XZPHOTOS_API_SECRET)
 
 logger.info(f"XZPhotos API 配置: 已配置")
 
 # 应用版本信息
-APP_VERSION = os.environ.get('APP_VERSION', '1.0.0')
-APP_VERSION_CODE = int(os.environ.get('APP_VERSION_CODE', '1'))
-CHANGELOG = os.environ.get('CHANGELOG', '')
+APP_VERSION = os.environ.get('APP_VERSION', _APP_VERSION)
+APP_VERSION_CODE = int(os.environ.get('APP_VERSION_CODE', _APP_VERSION_CODE))
+CHANGELOG = os.environ.get('CHANGELOG', _CHANGELOG)
 
 logger.info(f"应用版本: {APP_VERSION} (build {APP_VERSION_CODE})")
 
@@ -1283,7 +1324,7 @@ class ISFPApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("ISFP Connect")
         # 设置窗口图标
-        self.setWindowIcon(QIcon("assets/logo.png"))
+        self.setWindowIcon(QIcon(get_asset_path("logo.png")))
         # 设置 16:9 比例 (例如 1280x720)
         self.win_width = 1280
         self.win_height = 720
@@ -1296,14 +1337,15 @@ class ISFPApp(QMainWindow):
         # 初始化设置 - 使用本地 ini 文件存储，不使用注册表
         # 将配置保存在 data 文件夹下的 config.ini 中
         import os
-        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        base_path = get_app_data_dir()
+        data_dir = os.path.join(base_path, "data")
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
         config_path = os.path.join(data_dir, "config.ini")
         self.settings = QSettings(config_path, QSettings.IniFormat)
         
         # 签派数据管理器
-        self.dispatch_manager = DispatchManager(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+        self.dispatch_manager = DispatchManager(data_dir)
         
         # 线程管理器，防止 QThread 被 GC 回收
         self._active_threads = set()
@@ -1461,7 +1503,8 @@ class ISFPApp(QMainWindow):
                 self.bg_label.setPixmap(self.bg_pixmap.scaled(self.win_width, self.win_height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
         else:
             # 使用默认背景
-            default_bg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "background.png")
+            base_path = get_app_base_path()
+            default_bg = os.path.join(base_path, "assets", "background.png")
             self.bg_pixmap = QPixmap(default_bg)
             if not self.bg_pixmap.isNull():
                 self.bg_label.setPixmap(self.bg_pixmap.scaled(self.win_width, self.win_height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
@@ -1656,7 +1699,7 @@ class ISFPApp(QMainWindow):
         self.logo_label = QLabel()
         self.logo_label.setAttribute(Qt.WA_TranslucentBackground)
         self.logo_label.setFixedSize(35, 35)
-        logo_pix = QPixmap("assets/logo.png")
+        logo_pix = QPixmap(get_asset_path("logo.png"))
         if not logo_pix.isNull():
             self.logo_label.setPixmap(logo_pix.scaled(35, 35, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.logo_layout.addWidget(self.logo_label)
@@ -4340,9 +4383,9 @@ class ISFPApp(QMainWindow):
         self.fsd_disconnect_btn.setEnabled(True)
         self.show_notification("已连接到 FSD 服务器")
         
-        # 启动定期位置更新（每 5 秒）
-        self.fsd_client.start_position_updates(5000)
-        logger.info("FSD 位置更新已启动（每 5 秒）")
+        # 启动定期位置更新（每 0.2 秒）
+        self.fsd_client.start_position_updates(200)
+        logger.info("FSD 位置更新已启动（每 0.2 秒）")
         
         # 立即发送一次当前位置数据（如果有）
         if hasattr(self, '_latest_xplane_data') and self._latest_xplane_data:
@@ -5594,7 +5637,7 @@ class ISFPApp(QMainWindow):
         
         # 灵动岛开关
         self.island_switch = QCheckBox("启用灵动岛")
-        self.island_switch.setChecked(self.settings.value("dynamic_island_enabled", False, type=bool))
+        self.island_switch.setChecked(self.settings.value("dynamic_island_enabled", True, type=bool))
         self.island_switch.setStyleSheet("""
             QCheckBox {
                 color: #bdc3c7;
@@ -5936,7 +5979,8 @@ class ISFPApp(QMainWindow):
         if file_path:
             # 复制到 data 文件夹
             import shutil
-            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+            base_path = get_app_data_dir()
+            data_dir = os.path.join(base_path, "data")
             if not os.path.exists(data_dir):
                 os.makedirs(data_dir)
             target_path = os.path.join(data_dir, "custom_bg.jpg")
@@ -6001,7 +6045,8 @@ class ISFPApp(QMainWindow):
     
     def on_clear_log(self):
         """清空日志文件"""
-        logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        base_path = get_app_data_dir()
+        logs_dir = os.path.join(base_path, 'logs')
         
         # 清空 main.log
         log_file = os.path.join(logs_dir, 'main.log')
@@ -6091,7 +6136,7 @@ class ISFPApp(QMainWindow):
 
         # 悬浮 Logo
         logo = QLabel()
-        logo.setPixmap(QPixmap("assets/logo.png").scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        logo.setPixmap(QPixmap(get_asset_path("logo.png")).scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         logo.setStyleSheet("background: transparent; margin-bottom: 20px;")
         hero_layout.addWidget(logo, alignment=Qt.AlignCenter)
 
@@ -7285,7 +7330,7 @@ if __name__ == "__main__":
         pass
 
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("assets/logo.png"))
+    app.setWindowIcon(QIcon(get_asset_path("logo.png")))
     window = ISFPApp()
     window.show()
     sys.exit(app.exec())
